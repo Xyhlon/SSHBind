@@ -13,8 +13,21 @@ use std::collections::{BTreeMap, HashMap};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 
+use log::{debug, error, info, warn};
 use std::sync::{LazyLock, Mutex};
 
+/// Authenticates a user for the given SSH session.
+///
+/// # Arguments
+///
+/// * `session` - A reference to the `AsyncSession` object.
+/// * `creds_map` - A reference to a map containing credentials for each host.
+/// * `host` - The hostname or IP address of the SSH server.
+///
+/// # Returns
+///
+/// A `Result` indicating success or failure of the authentication process.
+///
 async fn userauth(
     session: &AsyncSession<TokioTcpStream>,
     creds_map: &YamlCreds,
@@ -22,115 +35,120 @@ async fn userauth(
 ) -> Result<(), Box<dyn Error>> {
     let creds = creds_map
         .get(host)
-        .expect(&format!("Couldn't find credentials for {}", host));
+        .ok_or_else(|| format!("Couldn't find credentials for {}", host))?;
     let username = creds.username.clone();
     let password = creds.password.clone();
     let totp_key = creds.totp_key.clone();
-    if totp_key.is_some() {
-        #[allow(unused_variables)]
-        let code = TOTPBuilder::new()
-            .base32_key(&totp_key.unwrap())
-            .finalize()
-            .unwrap()
-            .generate();
+
+    if let Some(key) = totp_key {
+        let code = TOTPBuilder::new().base32_key(&key).finalize()?.generate();
+        // Use the generated TOTP code as needed
     }
 
-    println!("Authenticating with: {}", username);
+    info!("Authenticating with: {}", username);
     session.userauth_password(&username, &password).await?;
 
-    // Verify that authentication succeeded.
     if session.authenticated() {
-        println!("SSH session established and authenticated!");
+        info!("SSH session established and authenticated!");
+        Ok(())
     } else {
-        eprintln!(
-            "Authentication failed. With user: {} into host: {}",
-            username, host,
+        let error_msg = format!(
+            "Authentication failed for user: {} on host: {}",
+            username, host
         );
-        return Err(format!(
-            "Authentication failed. With user: {} into host: {}",
-            username, host,
-        )
-        .into());
+        error!("{}", error_msg);
+        Err(error_msg.into())
     }
-    Ok(())
 }
 
 /// Establishes an SSH session chain through the given jump hosts.
-/// Returns the final AsyncSession connected to the last host in the chain.
+///
+/// # Arguments
+///
+/// * `jump_hosts` - A slice of strings representing the jump host addresses.
+/// * `creds_map` - A reference to a map containing credentials for each host.
+///
+/// # Returns
+///
+/// A `Result` containing the final `AsyncSession` connected to the last host in the chain,
+/// or an error if the connection fails.
+///
 async fn connect_chain(
     jump_hosts: &[String],
     creds_map: &YamlCreds,
 ) -> Result<AsyncSession<TokioTcpStream>, Box<dyn Error>> {
     assert!(!jump_hosts.is_empty(), "No jump hosts provided");
+    info!("Starting SSH chain connection through {:?}", jump_hosts);
 
-    // Connect to the first jump host over TCP
     let jump_socket_addr = jump_hosts[0]
         .to_socket_addrs()?
         .next()
-        .expect("Failed to resolve address");
+        .ok_or("Failed to resolve address")?;
+
     let mut session = AsyncSession::<TokioTcpStream>::connect(jump_socket_addr, None).await?;
     session.handshake().await?;
-    let host = &jump_socket_addr.ip().to_string();
-    let port = jump_socket_addr.port();
-    userauth(&session, creds_map, &format!("{host}:{port}")).await?;
-    println!("Jump {} connected: {}", 0, jump_hosts[0]);
+    userauth(&session, creds_map, &jump_hosts[0]).await?;
 
-    // Chain through subsequent jump hosts (if any)
-    let mut current_session = session;
     for (i, jump) in jump_hosts.iter().enumerate().skip(1) {
+        info!("Connecting through jump {}: {}", i, jump);
         let jump_socket_addr = jump
             .to_socket_addrs()?
             .next()
-            .expect("Failed to resolve address");
-        let host = &jump_socket_addr.ip().to_string();
-        let port = jump_socket_addr.port();
-        // Open a channel from the current session to the next host's SSH port
-        let mut channel = current_session
-            .channel_direct_tcpip(&host, port, None)
+            .ok_or("Failed to resolve address")?;
+        let mut channel = session
+            .channel_direct_tcpip(
+                &jump_socket_addr.ip().to_string(),
+                jump_socket_addr.port(),
+                None,
+            )
             .await?;
 
-        // Create a loopback TCP socket pair (listener + client socket)
-        let listener = TcpListener::bind("127.0.0.1:0").await?; // Bind to any available port
-        let local_addr = listener.local_addr()?; // Get the assigned port
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = listener.local_addr()?;
 
-        // task for accepting the forwading connnection we establish below
-        let accept_task = tokio::spawn(async move {
-            match listener.accept().await {
-                Ok((local_conn, _)) => Ok(local_conn),
-                Err(e) => Err(e),
-            }
-        });
+        let accept_task =
+            tokio::spawn(async move { listener.accept().await.map(|(local_conn, _)| local_conn) });
 
-        // Connect to the listener (this forms the TCP pair)
         let client_conn = TcpStream::connect(local_addr).await?;
-        let mut server_conn = match accept_task.await {
-            Ok(Ok(conn)) => conn, // Successfully received the accepted connection
-            Ok(Err(e)) => return Err(Box::new(e)), // The accept task failed with an IO error
-            Err(_) => {
-                return Err(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "Accept task failed",
-                )))
-            } // Task panicked or was dropped
-        };
+        let mut server_conn = accept_task.await?.map_err(|e| e.to_string())?;
 
-        // Relay data between SSH channel and the loopback TCP socket
         tokio::spawn(async move {
             let _ = copy_bidirectional(&mut channel, &mut server_conn).await;
         });
-        // Use the other side of the duplex as the transport for the next SSH session
-        // (Implement AsyncSessionStream for DuplexStream so that AsyncSession can use it)
-        // Create a new session with the duplex as underlying stream
-        let mut next_session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
-        next_session.handshake().await?;
 
-        userauth(&next_session, creds_map, &format!("{host}:{port}")).await?;
-        println!("Jump {} connected: {}", i, jump);
-        current_session = next_session;
+        session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
+        session.handshake().await?;
+        userauth(&session, creds_map, &jump_hosts[i]).await?;
     }
-    Ok(current_session)
+
+    Ok(session)
 }
 
+/// Runs an asynchronous TCP server that listens for incoming connections and forwards them
+/// through a chain of SSH jump hosts to a specified remote address.
+///
+/// # Arguments
+///
+/// * `addr` - The local address to bind the server to (e.g., "127.0.0.1:8000").
+/// * `jump_hosts` - A vector of SSH jump host addresses (e.g., ["jump1.example.com:22", "jump2.example.com:22"]).
+/// * `remote_addr` - The final remote address to forward connections to (e.g., "remote.example.com:80").
+/// * `creds` - A map containing SSH credentials for each host.
+/// * `cancel_token` - A cancellation token used to gracefully shut down the server.
+///
+/// # Returns
+///
+/// This function returns a `Result` indicating success or failure. On success, it runs the server
+/// indefinitely until the cancellation token is triggered.
+///
+/// # Errors
+///
+/// This function will return an error if:
+///
+/// * Binding to the specified local address fails.
+/// * Accepting incoming connections fails.
+/// * Establishing an SSH session to any of the jump hosts fails.
+/// * Forwarding data between the local connection and the SSH channel fails.
+///
 async fn run_server(
     addr: &str,
     jump_hosts: Vec<String>,
@@ -139,111 +157,213 @@ async fn run_server(
     cancel_token: CancellationToken,
 ) -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(addr).await?;
-    println!("Listening on {}", addr);
+    info!("Listening on {addr}");
 
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                println!("Cancellation signal received. Shutting down server.");
+                warn!("Shutdown signal received. Stopping server.");
                 break;
             }
             result = listener.accept() => {
-                let (mut inbound, _) = result?;
-                let session = connect_chain(&jump_hosts,  &creds).await?;
-                let remote_socket_addr = remote_addr
-                        .to_socket_addrs()?
-                        .next()
-                        .expect("Failed to resolve address");
-
-                let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
-
-                // TODO: make it work if the jump list is empty
-                // Spawn a task to handle the bidirectional copy.
-                // for no jumps
-                // let mut chan = TcpStream::connect(remote_addr).await?;
-                tokio::spawn(async move {
-                    match copy_bidirectional(&mut inbound, &mut channel).await {
-                        Ok((bytes_in, bytes_out)) => {
-                            println!("Forwarded {} bytes in, {} bytes out", bytes_in, bytes_out);
-                        }
-                        Err(e) => eprintln!("Connection error: {}", e),
+                match result {
+                    Ok((mut inbound, _)) => {
+                        let session = connect_chain(&jump_hosts, &creds).await?;
+                        let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
+                        let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+                        tokio::spawn(async move {
+                            if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
+                                error!("Connection error: {e}");
+                            }
+                        });
                     }
-                });
+                    Err(e) => error!("Failed to accept connection: {e}")
+                }
             }
         }
     }
     Ok(())
 }
 
+/// Checks if the `sops` binary is available in the system's PATH and returns its path if found.
+///
+/// # Returns
+///
+/// * `Ok(String)` - The absolute path to the `sops` binary.
+/// * `Err(String)` - An error message indicating that `sops` was not found.
+fn find_sops_binary() -> Result<String, String> {
+    // Retrieve the system's PATH environment variable
+    if let Ok(paths) = std::env::var("PATH") {
+        // Iterate over each path in the PATH variable
+        for path in std::env::split_paths(&paths) {
+            // Construct the full path to the `sops` executable
+            let sops_path = path.join("sops");
+            // On Windows, executables typically have a `.exe` extension
+            let sops_path_exe = path.join("sops.exe");
+
+            // Check if the `sops` executable exists and is a file
+            if sops_path.is_file() {
+                return Ok(sops_path.to_string_lossy().to_string());
+            } else if sops_path_exe.is_file() {
+                return Ok(sops_path_exe.to_string_lossy().to_string());
+            }
+        }
+    }
+    Err("`sops` binary not found in system's PATH.".to_string())
+}
+
+/// Binds a local address to a server that forwards incoming TCP connections through a chain
+/// of SSH jump hosts to a specified remote address. The server runs in a separate thread.
+///
+/// # Arguments
+///
+/// * `addr` - The local address to bind the server to (e.g., "127.0.0.1:8000").
+/// * `jump_hosts` - A vector of SSH jump host addresses (e.g., vec!["jump1.example.com:22", "jump2.example.com:22"]).
+/// * `remote_addr` - The final remote address to forward connections to (e.g., "remote.example.com:80").
+/// * `sopsfile` - The path to a SOPS-encrypted YAML file containing SSH credentials.
+///
+/// # Panics
+///
+/// This function will panic if:
+///
+/// * The `sops` command is not found in the system's PATH.
+/// * Decrypting the SOPS file fails.
+/// * Deserializing the decrypted YAML content into credentials fails.
+/// * Binding to the specified local address fails.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::thread;
+/// use sshbind::bind;
+///
+/// fn main() {
+///     let addr = "127.0.0.1:8000";
+///     let jump_hosts = vec!["jump1.example.com:22".to_string(), "jump2.example.com:22".to_string()];
+///     let remote_addr = "remote.example.com:80";
+///     let sopsfile = "/path/to/creds.sops.yaml";
+///
+///     // Start the server in a separate thread
+///     let server_thread = thread::spawn(move || {
+///         bind(addr, jump_hosts, remote_addr, sopsfile);
+///     });
+///
+///     // Perform other tasks or wait for user input
+///
+///     // Optionally, join the server thread if you want to wait for its completion
+///     // server_thread.join().unwrap();
+/// }
+/// ```
+///
+/// Note: Ensure that the `sops` command-line tool is installed and accessible in the system's PATH.
 pub fn bind(addr: &str, jump_hosts: Vec<String>, remote_addr: &str, sopsfile: &str) {
+    // Check for the `sops` binary
+    let sops_path = match find_sops_binary() {
+        Ok(path) => {
+            info!("Using `sops` binary at: {}", path);
+            path
+        }
+        Err(err) => {
+            error!("{}", err);
+            panic!("{}", err);
+        }
+    };
+
     let mut binds = BINDINGS.lock().unwrap();
 
-    let output = Command::new("which")
-        .arg("sops")
-        .output()
-        .expect("failed to execute process");
-    println!("status: {}", output.status);
-    println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-    println!("stdout: {}", String::from_utf8_lossy(&output.stderr));
+    if !std::path::Path::new(sopsfile).exists() {
+        error!("SOPS file not found: {sopsfile}");
+        return;
+    }
 
-    let output = Command::new("sops")
+    let output = Command::new(&sops_path)
         .arg("decrypt")
-        .arg(sopsfile) // user input as a separate argument
+        .arg(sopsfile)
         .output()
-        .expect("failed to execute process");
-    // TODO: file not found error
-    // TODO: not allowed / permissions error
-    // TODO: sops not installed error
-    // TODO: parse path is valid and throw error if not correct
-    // TODO: symlinking to other not allowed sopsfile is a sops security issue?
-    println!("status: {}", output.status);
-    // println!("stdout: {}", String::from_utf8_lossy(&output.stdout));
-    println!("stdout: {}", String::from_utf8_lossy(&output.stderr));
-    let creds: YamlCreds = serde_yml::from_str(&String::from_utf8_lossy(&output.stdout))
-        .expect(&format!("Failed to deserialize {}", sopsfile)); // throw error that yaml has incorrect format
+        .expect("Failed to execute sops command");
 
-    // Create a cancellation token.
+    if !output.status.success() {
+        error!(
+            "SOPS decryption failed: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let creds: YamlCreds = match serde_yml::from_str(&String::from_utf8_lossy(&output.stdout)) {
+        Ok(creds) => creds,
+        Err(e) => {
+            error!("Failed to deserialize credentials: {e}");
+            return;
+        }
+    };
+
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();
     let bind_addr = addr.to_string();
     let remote_addr = remote_addr.to_string();
 
-    // Spawn a thread that runs our async server.
     let handle = thread::spawn(move || {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
             if let Err(e) =
                 run_server(&bind_addr, jump_hosts, &remote_addr, creds, token_clone).await
             {
-                eprintln!("Server encountered an error: {}", e);
+                error!("Server error: {e}");
             }
         });
     });
-    binds.insert(addr.to_string(), (cancel_token.clone(), handle));
+
+    binds.insert(addr.to_string(), (cancel_token, handle));
 }
 
+/// A map of credentials loaded from a YAML file.
+pub type YamlCreds = BTreeMap<String, Creds>;
+
+/// Credentials required for SSH authentication.
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Creds {
+    /// SSH username.
     pub username: String,
+    /// SSH password.
     pub password: String,
+    /// Optional base32 TOTP key for two-factor authentication.
     pub totp_key: Option<String>,
 }
 
-pub type YamlCreds = BTreeMap<String, Creds>;
-
 static BINDINGS: LazyLock<
     Mutex<HashMap<String, (CancellationToken, std::thread::JoinHandle<()>)>>,
-> = LazyLock::new(|| {
-    let map = HashMap::new();
-    Mutex::new(map)
-});
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Unbinds a previously established binding for the given address.
+///
+/// This function cancels the running server associated with the provided address
+/// and waits for its thread to finish. If the address is not found in the bindings,
+/// a warning is logged.
+///
+/// # Arguments
+///
+/// * `addr` - The address of the binding to unbind.
+///
+/// # Example
+///
+/// ```
+/// use sshbind::unbind;
+///
+/// unbind("127.0.0.1:8000");
+/// ```
 pub fn unbind(addr: &str) {
     let mut binds = BINDINGS.lock().unwrap();
-    if let Some((addr, (cancel_token, handle))) = binds.remove_entry(addr) {
-        println!("Destructing binding on {}", addr);
-        println!("Signaling cancellation...");
+    if let Some((cancel_token, handle)) = binds.remove(addr) {
+        info!("Destructing binding on {}", addr);
+        info!("Signaling cancellation...");
         cancel_token.cancel();
-        handle.join().unwrap();
+        if let Err(e) = handle.join() {
+            error!("Failed to join thread for {}: {:?}", addr, e);
+        } else {
+            info!("Successfully unbound {}", addr);
+        }
+    } else {
+        warn!("No binding found for {}", addr);
     }
 }
