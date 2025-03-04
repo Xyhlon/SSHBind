@@ -14,7 +14,7 @@ use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 
 use log::{debug, error, info, warn};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 /// Authenticates a user for the given SSH session.
 ///
@@ -155,9 +155,17 @@ async fn run_server(
     remote_addr: &str,
     creds: YamlCreds,
     cancel_token: CancellationToken,
+    pair: Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind(addr).await?;
     info!("Listening on {addr}");
+    {
+        let (lock, cvar) = &*pair;
+        let mut pending = lock.lock().unwrap();
+        *pending = false;
+        // We notify the condvar that the value has changed.
+        cvar.notify_one();
+    }
 
     loop {
         tokio::select! {
@@ -303,11 +311,21 @@ pub fn bind(addr: &str, jump_hosts: Vec<String>, remote_addr: &str, sopsfile: &s
     let bind_addr = addr.to_string();
     let remote_addr = remote_addr.to_string();
 
+    let pair = Arc::new((Mutex::new(true), Condvar::new()));
+    let pair_clone = Arc::clone(&pair);
+
     let handle = thread::spawn(move || {
         let rt = Runtime::new().unwrap();
         rt.block_on(async {
-            if let Err(e) =
-                run_server(&bind_addr, jump_hosts, &remote_addr, creds, token_clone).await
+            if let Err(e) = run_server(
+                &bind_addr,
+                jump_hosts,
+                &remote_addr,
+                creds,
+                token_clone,
+                pair_clone,
+            )
+            .await
             {
                 error!("Server error: {e}");
             }
@@ -315,6 +333,12 @@ pub fn bind(addr: &str, jump_hosts: Vec<String>, remote_addr: &str, sopsfile: &s
     });
 
     binds.insert(addr.to_string(), (cancel_token, handle));
+
+    // Wait for the thread to start up, bind and listen.
+    let (lock, cvar) = &*pair;
+    let _guard = cvar
+        .wait_while(lock.lock().unwrap(), |pending| *pending)
+        .unwrap();
 }
 
 /// A map of credentials loaded from a YAML file.
