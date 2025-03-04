@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 /// Authenticates a user for the given SSH session.

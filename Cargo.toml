@@ -20,18 +20,8 @@ tokio-util = "0.7.13"
 secrecy = "0.10.3"
 age = "0.11.1"
 tempfile = "3.17.1"
-rand = "0.8"
 tokio = { version = "1", features = ["full"] }
 russh = "0.50.4"
-russh-keys = "0.49.2"
 async-trait = "0.1.86"
 log = "0.4.26"
 env_logger = "0.11.6"
-ssh-key = { version = "0.6.7", features = [
-  "ed25519",
-  "rsa",
-  "p256",
-  "p384",
-  "p521",
-  "encryption",
-] }
