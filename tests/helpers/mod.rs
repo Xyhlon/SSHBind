@@ -4,8 +4,6 @@ use secrecy::ExposeSecret;
 use serde_yml;
 use sshbind::YamlCreds;
 use std::fs;
-use std::fs::File;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
