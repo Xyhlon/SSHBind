@@ -1,8 +1,10 @@
-use log::info;
+use env_logger::Builder;
+use log::LevelFilter;
 use russh::server::Server;
 use sshbind::{bind, unbind};
 use sshbind::{Creds, YamlCreds};
 use std::collections::HashMap;
+use std::io::Write;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use std::sync::{Arc, LazyLock, Mutex};
@@ -13,8 +15,17 @@ mod helpers;
 
 static EXCLUSIVE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+// Ensure the logger is initialized only once
+static LOGGER: LazyLock<()> = LazyLock::new(|| {
+    Builder::new()
+        .filter(None, LevelFilter::Info) // Adjust log level as needed
+        .format(|buf, record| writeln!(buf, "[{}] - {}", record.level(), record.args()))
+        .init();
+});
+
 #[test]
 fn fail_not_path() {
+    let _ = *LOGGER; // Ensure logger is initialized
     let bind_addr = "127.0.0.1:8000";
     let jump_hosts = vec!["127.0.0.0:20".to_string()];
     let service_addr = "127.0.0.0:80";
