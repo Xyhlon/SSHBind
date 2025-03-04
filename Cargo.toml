@@ -7,14 +7,14 @@ license = "MIT"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-env_logger = "0.11.6"
-log = "0.4.26"
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7.13"
 async-ssh2-lite = { version = "0.5.0", features = ["tokio"] }
+env_logger = "0.11.6"
+libreauth = "0.17.0"
+log = "0.4.26"
 serde = { version = "1.0", features = ["derive"] }
 serde_yml = "0.0.12"
-libreauth = "0.17.0"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7.13"
 
 [dev-dependencies]
 secrecy = "0.10.3"
@@ -28,10 +28,10 @@ async-trait = "0.1.86"
 log = "0.4.26"
 env_logger = "0.11.6"
 ssh-key = { version = "0.6.7", features = [
-    "ed25519",
-    "rsa",
-    "p256",
-    "p384",
-    "p521",
-    "encryption",
+  "ed25519",
+  "rsa",
+  "p256",
+  "p384",
+  "p521",
+  "encryption",
 ] }
