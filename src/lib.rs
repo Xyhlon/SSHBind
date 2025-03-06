@@ -15,6 +15,33 @@ use tokio::net::{TcpListener, TcpStream};
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+/// Checks if the `sops` binary is available in the system's PATH and returns its path if found.
+///
+/// # Returns
+///
+/// * `Ok(String)` - The absolute path to the `sops` binary.
+/// * `Err(String)` - An error message indicating that `sops` was not found.
+fn find_sops_binary() -> Result<String, String> {
+    // Retrieve the system's PATH environment variable
+    if let Ok(paths) = std::env::var("PATH") {
+        // Iterate over each path in the PATH variable
+        for path in std::env::split_paths(&paths) {
+            // Construct the full path to the `sops` executable
+            let sops_path = path.join("sops");
+            // On Windows, executables typically have a `.exe` extension
+            let sops_path_exe = path.join("sops.exe");
+
+            // Check if the `sops` executable exists and is a file
+            if sops_path.is_file() {
+                return Ok(sops_path.to_string_lossy().to_string());
+            } else if sops_path_exe.is_file() {
+                return Ok(sops_path_exe.to_string_lossy().to_string());
+            }
+        }
+    }
+    Err("`sops` binary not found in system's PATH.".to_string())
+}
+
 /// Authenticates a user for the given SSH session.
 ///
 /// # Arguments
@@ -58,6 +85,91 @@ async fn userauth(
         error!("{}", error_msg);
         Err(error_msg.into())
     }
+}
+
+async fn process_connection(
+    mut inbound: TcpStream,
+    jump_hosts: &[String],
+    remote_addr: &str,
+    creds: &YamlCreds,
+) -> Result<(), Box<dyn Error>> {
+    let session = connect_chain(jump_hosts, creds).await?;
+    let remote_socket_addr = remote_addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or("Failed to resolve remote address")?;
+    let mut channel = session
+        .channel_direct_tcpip(
+            &remote_socket_addr.ip().to_string(),
+            remote_socket_addr.port(),
+            None,
+        )
+        .await?;
+    copy_bidirectional(&mut inbound, &mut channel).await?;
+    Ok(())
+}
+
+async fn run_server(
+    addr: &str,
+    jump_hosts: Vec<String>,
+    remote_addr: &str,
+    creds: YamlCreds,
+    cancel_token: CancellationToken,
+    pair: Arc<(Mutex<bool>, Condvar)>,
+    debug: Option<bool>,
+) -> Result<(), Box<dyn Error>> {
+    // Debug branch: simulate a connect by establishing an outbound connection and processing it
+    if let Some(true) = debug {
+        let listener = TcpListener::bind(addr).await?;
+        info!("Listening on {addr}");
+        println!("Debugging enabled");
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        // Simulate an inbound connection by connecting to the first jump host.
+        let accept_task =
+            tokio::spawn(async move { listener.accept().await.map(|(local_conn, _)| local_conn) });
+
+        let _client_conn = TcpStream::connect(addr).await?;
+        let server_conn = accept_task.await?.map_err(|e| e.to_string())?;
+        process_connection(server_conn, &jump_hosts, remote_addr, &creds).await?;
+        println!("Simulated connection complete");
+    }
+    let listener = TcpListener::bind(addr).await?;
+    info!("Listening on {addr}");
+
+    // Notify that initialization is complete.
+    {
+        let (lock, cvar) = &*pair;
+        let mut pending = lock.lock().unwrap();
+        *pending = false;
+        println!("Done");
+        cvar.notify_one();
+    }
+
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                warn!("Shutdown signal received. Stopping server.");
+                break;
+            }
+            result = listener.accept() => {
+                match result {
+                    Ok((inbound, _)) => {
+                        // Clone data as needed for the spawned task.
+                        let jump_hosts_clone = jump_hosts.clone();
+                        let remote_addr = remote_addr.to_string();
+                        let creds_clone = creds.clone(); // Ensure YamlCreds implements Clone
+                        tokio::spawn(async move {
+                            if let Err(e) = process_connection(inbound, &jump_hosts_clone, &remote_addr, &creds_clone).await {
+                                error!("Connection error: {e}");
+                            }
+                        });
+                    }
+                    Err(e) => error!("Failed to accept connection: {e}")
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Establishes an SSH session chain through the given jump hosts.
@@ -148,76 +260,60 @@ async fn connect_chain(
 /// * Establishing an SSH session to any of the jump hosts fails.
 /// * Forwarding data between the local connection and the SSH channel fails.
 ///
-async fn run_server(
-    addr: &str,
-    jump_hosts: Vec<String>,
-    remote_addr: &str,
-    creds: YamlCreds,
-    cancel_token: CancellationToken,
-    pair: Arc<(Mutex<bool>, Condvar)>,
-) -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind(addr).await?;
-    info!("Listening on {addr}");
-    {
-        let (lock, cvar) = &*pair;
-        let mut pending = lock.lock().unwrap();
-        *pending = false;
-        // We notify the condvar that the value has changed.
-        cvar.notify_one();
-    }
-
-    loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                warn!("Shutdown signal received. Stopping server.");
-                break;
-            }
-            result = listener.accept() => {
-                match result {
-                    Ok((mut inbound, _)) => {
-                        let session = connect_chain(&jump_hosts, &creds).await?;
-                        let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
-                        let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
-                        tokio::spawn(async move {
-                            if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                error!("Connection error: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => error!("Failed to accept connection: {e}")
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Checks if the `sops` binary is available in the system's PATH and returns its path if found.
-///
-/// # Returns
-///
-/// * `Ok(String)` - The absolute path to the `sops` binary.
-/// * `Err(String)` - An error message indicating that `sops` was not found.
-fn find_sops_binary() -> Result<String, String> {
-    // Retrieve the system's PATH environment variable
-    if let Ok(paths) = std::env::var("PATH") {
-        // Iterate over each path in the PATH variable
-        for path in std::env::split_paths(&paths) {
-            // Construct the full path to the `sops` executable
-            let sops_path = path.join("sops");
-            // On Windows, executables typically have a `.exe` extension
-            let sops_path_exe = path.join("sops.exe");
-
-            // Check if the `sops` executable exists and is a file
-            if sops_path.is_file() {
-                return Ok(sops_path.to_string_lossy().to_string());
-            } else if sops_path_exe.is_file() {
-                return Ok(sops_path_exe.to_string_lossy().to_string());
-            }
-        }
-    }
-    Err("`sops` binary not found in system's PATH.".to_string())
-}
+// async fn run_server(
+//     addr: &str,
+//     jump_hosts: Vec<String>,
+//     remote_addr: &str,
+//     creds: YamlCreds,
+//     cancel_token: CancellationToken,
+//     pair: Arc<(Mutex<bool>, Condvar)>,
+//     debug: Option<bool>,
+// ) -> Result<(), Box<dyn Error>> {
+//     let listener = TcpListener::bind(addr).await?;
+//     info!("Listening on {addr}");
+//     if let Some(debug) = debug {
+//         if debug {
+//             println!("Debugging enabled");
+//             // std::thread::sleep(std::time::Duration::from_secs(1));
+//             // TcpStream::connect(&jump_hosts[0]).await?;
+//             connect_chain(&jump_hosts, &creds).await?;
+//             println!("Connection ");
+//         }
+//     }
+//     {
+//         let (lock, cvar) = &*pair;
+//         let mut pending = lock.lock().unwrap();
+//         *pending = false;
+//         // We notify the condvar that the value has changed.
+//         println!("Done");
+//         cvar.notify_one();
+//     }
+//
+//     loop {
+//         tokio::select! {
+//             _ = cancel_token.cancelled() => {
+//                 warn!("Shutdown signal received. Stopping server.");
+//                 break;
+//             }
+//             result = listener.accept() => {
+//                 match result {
+//                     Ok((mut inbound, _)) => {
+//                         let session = connect_chain(&jump_hosts, &creds).await?;
+//                         let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
+//                         let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+//                         tokio::spawn(async move {
+//                             if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
+//                                 error!("Connection error: {e}");
+//                             }
+//                         });
+//                     }
+//                     Err(e) => error!("Failed to accept connection: {e}")
+//                 }
+//             }
+//         }
+//     }
+//     Ok(())
+// }
 
 #[allow(clippy::needless_doctest_main)]
 /// Binds a local address to a server that forwards incoming TCP connections through a chain
@@ -264,7 +360,13 @@ fn find_sops_binary() -> Result<String, String> {
 /// ```
 ///
 /// Note: Ensure that the `sops` command-line tool is installed and accessible in the system's PATH.
-pub fn bind(addr: &str, jump_hosts: Vec<String>, remote_addr: &str, sopsfile: &str) {
+pub fn bind(
+    addr: &str,
+    jump_hosts: Vec<String>,
+    remote_addr: &str,
+    sopsfile: &str,
+    debug: Option<bool>,
+) {
     // Check for the `sops` binary
     let sops_path = match find_sops_binary() {
         Ok(path) => {
@@ -324,6 +426,7 @@ pub fn bind(addr: &str, jump_hosts: Vec<String>, remote_addr: &str, sopsfile: &s
                 creds,
                 token_clone,
                 pair_clone,
+                debug,
             )
             .await
             {

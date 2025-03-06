@@ -125,6 +125,22 @@ impl SSHServer {
             SSHServer { users }
         }
     }
+
+    pub fn run_on_address_with_signal<A: tokio::net::ToSocketAddrs + Send>(
+        &mut self,
+        config: std::sync::Arc<russh::server::Config>,
+        addrs: A,
+        ready_tx: tokio::sync::oneshot::Sender<()>,
+    ) -> impl std::future::Future<Output = Result<(), std::io::Error>> + Send + use<'_, A>
+    where
+        Self: Send,
+    {
+        async move {
+            let socket = tokio::net::TcpListener::bind(addrs).await?;
+            let _ = ready_tx.send(());
+            self.run_on_socket(config, &socket).await
+        }
+    }
 }
 
 impl Server for SSHServer {
