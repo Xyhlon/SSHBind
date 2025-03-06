@@ -3,6 +3,12 @@ name = "sshbind"
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
+authors = ["Maximilian Philipp <maxkon2000@gmail.com>"]
+description = "SSHBind is a Rust library that securely binds remote services behind multiple SSH jump hosts to a local socket, enabling seamless access with encrypted credential management, TOTP-based two-factor authentication, and automatic reconnection."
+readme = "README.md"
+homepage = "https://github.com/Xyhlon/SSHBind"
+repository = "https://github.com/Xyhlon/SSHBind"
+documentation = "https://docs.rs/sshbind"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
