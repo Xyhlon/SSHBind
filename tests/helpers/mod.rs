@@ -1,16 +1,17 @@
 use age::x25519;
-use russh;
 use secrecy::ExposeSecret;
-use serde_yml;
 use sshbind::YamlCreds;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
-use tempfile::{tempdir, TempDir};
+use tempfile::TempDir;
 
 pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
-    let tmp_dir = tempdir().expect("Failed to create temp dir");
+    let binding = std::env::current_dir().unwrap();
+    let wd = binding.as_path();
+    let tmp_dir = TempDir::new_in(wd).expect("Failed to create temp dir");
+    info!("Temp dir: {:?}", tmp_dir.path());
     let file_path = tmp_dir.path().join("secrets.yaml");
 
     // Generate a new age key pair.
@@ -26,7 +27,7 @@ pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
 
     // Create a minimal SOPS configuration file.
     // Here we specify that for any YAML file, sops should use the given age public key.
-    let config_content = format!("keys:\n  - &master {}\ncreation_rules:\n  - path_regex: secrets.yaml$\n    key_groups:\n    - age:\n      - *master", public_key.to_string());
+    let config_content = format!("keys:\n  - &master {}\ncreation_rules:\n  - path_regex: secrets.yaml$\n    key_groups:\n    - age:\n      - *master", public_key);
 
     fs::write(&config_path, config_content).expect("Failed to write config");
 
@@ -40,7 +41,7 @@ pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
     fs::write(&file_path, stringified).expect("Failed to write to file");
     let path = file_path.to_str().unwrap();
 
-    let _ = std::env::set_var("SOPS_AGE_KEY_FILE", key_path.to_str().unwrap());
+    std::env::set_var("SOPS_AGE_KEY_FILE", key_path.to_str().unwrap());
     let _ = std::env::set_current_dir(tmp_dir.path());
 
     let output = Command::new("sops")
@@ -109,7 +110,7 @@ pub struct SSHServer {
 impl SSHServer {
     pub fn new(users: Option<HashMap<String, Credentials>>) -> Self {
         if let Some(users) = users {
-            return SSHServer { users };
+            SSHServer { users }
         } else {
             let mut users = HashMap::new();
             users.insert(
@@ -121,7 +122,7 @@ impl SSHServer {
                     allowed_pubkey_base64: None,
                 },
             );
-            return SSHServer { users };
+            SSHServer { users }
         }
     }
 }
@@ -147,6 +148,7 @@ impl Server for SSHServer {
 impl Handler for SSHServer {
     type Error = Box<dyn std::error::Error + Send + Sync>;
 
+    #[allow(clippy::manual_async_fn)]
     fn auth_password(
         &mut self,
         user: &str,
@@ -175,6 +177,7 @@ impl Handler for SSHServer {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn auth_publickey(
         &mut self,
         user: &str,
@@ -205,6 +208,7 @@ impl Handler for SSHServer {
         }
     }
 
+    #[allow(clippy::manual_async_fn)]
     fn auth_keyboard_interactive<'a>(
         &'a mut self,
         user: &str,
@@ -229,9 +233,7 @@ impl Handler for SSHServer {
                 } else {
                     let responses: Vec<String> = response
                         .unwrap()
-                        .into_iter()
-                        .map(|b| String::from_utf8(b.to_vec()).ok())
-                        .filter_map(|x| x)
+                        .filter_map(|b| String::from_utf8(b.to_vec()).ok())
                         .collect();
                     if let Some(expected) = &cred.two_factor_code {
                         if responses.first().map(|s| s.trim()) == Some(expected.as_str()) {
@@ -257,7 +259,7 @@ impl Handler for SSHServer {
         }
     }
 
-    #[allow(unused_variables)]
+    #[allow(unused_variables, clippy::manual_async_fn)]
     fn channel_open_session(
         &mut self,
         channel: Channel<russh::server::Msg>,
@@ -269,7 +271,7 @@ impl Handler for SSHServer {
         }
     }
 
-    #[allow(unused_mut)]
+    #[allow(unused_mut, clippy::manual_async_fn)]
     fn channel_open_direct_tcpip(
         &mut self,
         mut channel: Channel<russh::server::Msg>,

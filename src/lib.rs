@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_yml;
 use std::error::Error;
 use std::net::ToSocketAddrs;
 use std::process::Command;
@@ -41,7 +40,7 @@ async fn userauth(
     let totp_key = creds.totp_key.clone();
 
     if let Some(key) = totp_key {
-        let code = TOTPBuilder::new().base32_key(&key).finalize()?.generate();
+        let _code = TOTPBuilder::new().base32_key(&key).finalize()?.generate();
         // Use the generated TOTP code as needed
     }
 
@@ -220,6 +219,7 @@ fn find_sops_binary() -> Result<String, String> {
     Err("`sops` binary not found in system's PATH.".to_string())
 }
 
+#[allow(clippy::needless_doctest_main)]
 /// Binds a local address to a server that forwards incoming TCP connections through a chain
 /// of SSH jump hosts to a specified remote address. The server runs in a separate thread.
 ///
@@ -355,6 +355,7 @@ pub struct Creds {
     pub totp_key: Option<String>,
 }
 
+#[allow(clippy::type_complexity)]
 static BINDINGS: LazyLock<
     Mutex<HashMap<String, (CancellationToken, std::thread::JoinHandle<()>)>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
