@@ -20,6 +20,8 @@
     };
 
     statix.url = "github:oppiliappan/statix";
+
+    pre-commit-hooks.url = "github:cachix/git-hooks.nix";
   };
 
   outputs = {
@@ -30,6 +32,7 @@
     flake-utils,
     advisory-db,
     statix,
+    pre-commit-hooks,
     ...
   }:
     flake-utils.lib.eachDefaultSystem (system: let
@@ -37,7 +40,8 @@
 
       inherit (pkgs) lib;
 
-      craneLib = (crane.mkLib pkgs).overrideToolchain
+      craneLib =
+        (crane.mkLib pkgs).overrideToolchain
         fenix.packages.${system}.stable.toolchain;
 
       src = craneLib.cleanCargoSource ./.;
@@ -81,12 +85,33 @@
       sshbind = craneLib.buildPackage (commonArgs
         // {
           inherit cargoArtifacts;
-	doCheck = false;
+          doCheck = false;
         });
     in {
       checks = {
         # Build the crate as part of `nix flake check` for convenience
         inherit sshbind;
+
+        pre-commit-check = pre-commit-hooks.lib.${system}.run {
+          src = ./.;
+          hooks = {
+            check-case-conflicts.enable = true;
+            check-executables-have-shebangs.enable = true;
+            check-merge-conflicts.enable = true;
+            check-shebang-scripts-are-executable.enable = true;
+            check-toml.enable = true;
+            check-yaml.enable = true;
+            detect-private-keys.enable = true;
+            end-of-file-fixer.enable = true;
+            mixed-line-endings.enable = true;
+            trim-trailing-whitespace.enable = true;
+            alejandra.enable = true;
+            mdformat.enable = true;
+            pre-commit-hook-ensure-sops.enable = true;
+            taplo.enable = true;
+          };
+          configPath = ".pre-commit-config-nix.yaml";
+        };
 
         # Run clippy (and deny all warnings) on the crate source,
         # again, reusing the dependency artifacts from above.
@@ -135,7 +160,7 @@
             partitions = 1;
             partitionType = "count";
             withLlvmCov = true;
-	    # sandbox-paths = /tmp;
+            # sandbox-paths = /tmp;
           });
       };
 
@@ -169,7 +194,6 @@
         packages = [
           pkgs.openssl
           pkgs.sops
-          pkgs.pre-commit-hook-ensure-sops
           pkgs.age
           pkgs.statix
           # pkgs.ripgrep
