@@ -1,14 +1,21 @@
 # SSHBind
 
-SSHBind is a Rust library that enables developers to programmatically bind services located behind multiple SSH connections to a local socket. This facilitates secure and seamless access to remote services, even those that are otherwise unreachable.
+SSHBind is a Rust library that enables developers to programmatically bind services
+located behind multiple SSH connections to a local socket. This facilitates secure and
+seamless access to remote services, even those that are otherwise unreachable.
 
 ## Features
 
-- **Multiple Jump Host Support**: Navigate through a series of SSH jump hosts to reach the target service.
-- **Local Socket Binding**: Expose remote services on local Unix sockets, making them accessible as if they were running locally.
-- **Encrypted Credential Management**: Utilize SOPS-encrypted YAML files for secure and reproducible environment configurations.
-- **Programmatic Two-Factor Authentication**: Support for TOTP-based 2FA, with plans to include user agent support in future releases.
-- **Automatic Reconnection**: Seamlessly handle connection interruptions by automatically reconnecting to the service.
+- **Multiple Jump Host Support**: Navigate through a series of SSH jump hosts to reach
+  the target service.
+- **Local Socket Binding**: Expose remote services on local Unix sockets, making them
+  accessible as if they were running locally.
+- **Encrypted Credential Management**: Utilize SOPS-encrypted YAML files for secure and
+  reproducible environment configurations.
+- **Programmatic Two-Factor Authentication**: Support for TOTP-based 2FA, with plans to
+  include user agent support in future releases.
+- **Automatic Reconnection**: Seamlessly handle connection interruptions by
+  automatically reconnecting to the service.
 
 ## Prerequisites
 
@@ -32,7 +39,8 @@ cargo build
 
 ## Configuration
 
-SSHBind requires an encrypted YAML file containing the credentials for each host. This file should be encrypted using SOPS to ensure security.
+SSHBind requires an encrypted YAML file containing the credentials for each host. This
+file should be encrypted using SOPS to ensure security.
 
 **Sample `secrets.yaml` Structure:**
 
@@ -42,7 +50,6 @@ host:
   password: your_password
   totp_key: optional_base32_totp_key
 ```
-
 
 - `host`: The hostname or IP address of the target machine.
 - `username`: The SSH username.
@@ -79,23 +86,25 @@ fn main() {
 }
 ```
 
-
-For detailed API documentation and advanced usage, refer to the [official documentation](https://docs.rs/sshbind).
+For detailed API documentation and advanced usage, refer to the
+[official documentation](https://docs.rs/sshbind).
 
 ## License
 
-SSHBind is licensed under the MIT License. For more details, see the [LICENSE](./LICENSE) file.
+SSHBind is licensed under the MIT License. For more details, see the
+[LICENSE](./LICENSE) file.
 
-Dependencies of the code are subject to additional licenses as noted in the [THIRD_PARTY_LICENSES](./THIRD_PARTY_LICENSES) folder.
+Dependencies of the code are subject to additional licenses as noted in the
+[THIRD_PARTY_LICENSES](./THIRD_PARTY_LICENSES) folder.
 
 ## Contributing
 
 Contributions are welcome! To contribute:
 
 1. Fork the repository.
-2. Create a new branch.
-3. Make your changes.
-4. Submit a pull request.
+1. Create a new branch.
+1. Make your changes.
+1. Submit a pull request.
 
-Please ensure your code adheres to the project's coding standards and includes appropriate tests.
-
+Please ensure your code adheres to the project's coding standards and includes
+appropriate tests.
