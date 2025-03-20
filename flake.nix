@@ -47,7 +47,7 @@
 
       craneLib =
         (crane.mkLib pkgs).overrideToolchain
-        fenix.packages.${system}.stable.toolchain;
+        fenix.packages.${system}.stable.completeToolchain;
 
       src = craneLib.cleanCargoSource ./.;
 
