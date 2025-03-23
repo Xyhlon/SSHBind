@@ -175,14 +175,24 @@ async fn run_server(
             result = listener.accept() => {
                 match result {
                     Ok((mut inbound, _)) => {
-                        let session = connect_chain(&jump_hosts, &creds).await?;
-                        let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
-                        let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
-                        tokio::spawn(async move {
-                            if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                error!("Connection error: {e}");
-                            }
-                        });
+                        if jump_hosts.is_empty() {
+                            let mut outbound = TcpStream::connect(remote_addr).await?;
+                            tokio::spawn(async move {
+                                if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
+                                    error!("Connection error: {e}");
+                                }
+                            });
+                        }
+                        else{
+                            let session = connect_chain(&jump_hosts, &creds).await?;
+                            let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
+                            let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+                            tokio::spawn(async move {
+                                if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
+                                    error!("Connection error: {e}");
+                                }
+                            });
+                        }
                     }
                     Err(e) => error!("Failed to accept connection: {e}")
                 }
