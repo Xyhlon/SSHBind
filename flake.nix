@@ -201,6 +201,7 @@
           pkgs.sops
           pkgs.age
           pkgs.statix
+          pkgs.gdb
           # pkgs.ripgrep
         ];
       };

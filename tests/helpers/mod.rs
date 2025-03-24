@@ -1,4 +1,5 @@
 use age::x25519;
+use libreauth::oath::TOTPBuilder;
 use secrecy::ExposeSecret;
 use sshbind::YamlCreds;
 use std::fs;
@@ -67,7 +68,7 @@ use tokio::net::TcpStream;
 ///
 /// Credentials and SSHServer state.
 ///
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Credentials {
     pub password: String,
     pub require_2fa: bool,
@@ -77,28 +78,23 @@ pub struct Credentials {
 
 impl From<sshbind::Creds> for Credentials {
     fn from(creds: sshbind::Creds) -> Self {
-        if let Some(totp_key) = creds.totp_key {
-            Credentials {
+        if let Some(ref totp_key) = creds.totp_key {
+            #[allow(clippy::needless_return)]
+            return Credentials {
                 password: creds.password.clone(),
                 require_2fa: true,
                 two_factor_code: Some(totp_key.clone()),
                 allowed_pubkey_base64: None,
-            }
+            };
         } else {
-            Credentials {
+            #[allow(clippy::needless_return)]
+            return Credentials {
                 password: creds.password.clone(),
                 require_2fa: false,
                 two_factor_code: None,
                 allowed_pubkey_base64: None,
-            }
+            };
         };
-
-        Credentials {
-            password: creds.password.clone(),
-            require_2fa: false,
-            two_factor_code: None,
-            allowed_pubkey_base64: None,
-        }
     }
 }
 
@@ -225,31 +221,103 @@ impl Handler for SSHServer {
                     return Ok(Auth::Accept);
                 }
                 if response.is_none() {
+                    info!("2FA required for user {}", user);
                     return Ok(Auth::Partial {
                         name: "".into(),
                         instructions: "2FA required".into(),
-                        prompts: vec![(Cow::from("Enter 2FA code: "), false)].into(),
+                        prompts: vec![
+                            (Cow::from("Password: "), false),
+                            (Cow::from("Enter 2FA code: "), false),
+                        ]
+                        .into(),
                     });
                 } else {
+                    info!("Else");
                     let responses: Vec<String> = response
                         .unwrap()
                         .filter_map(|b| String::from_utf8(b.to_vec()).ok())
                         .collect();
-                    if let Some(expected) = &cred.two_factor_code {
-                        if responses.first().map(|s| s.trim()) == Some(expected.as_str()) {
-                            info!("2FA accepted for user {}", user);
-                            return Ok(Auth::Accept);
-                        } else {
-                            error!("Invalid 2FA code provided by user {}", user);
-                            return Ok(Auth::Reject {
-                                proceed_with_methods: None,
-                            });
-                        }
+                    info!("2FA response: {:?}", responses);
+
+                    let password = responses
+                        .first()
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+                    let otp_code = responses
+                        .get(1)
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_default();
+
+                    let ref_code = match cred.two_factor_code.as_ref() {
+                        Some(key) => TOTPBuilder::new().base32_key(key).finalize()?.generate(),
+                        None => "".to_string(),
+                    };
+                    if password != cred.password {
+                        error!("Invalid password provided by user {}", user);
+                        return Ok(Auth::Reject {
+                            proceed_with_methods: None,
+                        });
                     }
-                    error!("No 2FA code configured for user {}", user);
-                    return Ok(Auth::Reject {
-                        proceed_with_methods: None,
-                    });
+                    if otp_code != ref_code {
+                        error!("Invalid 2FA code provided by user {}", user);
+                        return Ok(Auth::Reject {
+                            proceed_with_methods: None,
+                        });
+                    }
+
+                    info!("2FA accepted for user {}", user);
+                    return Ok(Auth::Accept);
+                }
+            } else if response.is_none() {
+                info!("2FA required for user {}", user);
+                return Ok(Auth::Partial {
+                    name: "".into(),
+                    instructions: "2FA required".into(),
+                    prompts: vec![
+                        (Cow::from("Username: "), true),
+                        (Cow::from("Password: "), false),
+                        (Cow::from("Enter 2FA code: "), false),
+                    ]
+                    .into(),
+                });
+            } else {
+                let responses: Vec<String> = response
+                    .unwrap()
+                    .filter_map(|b| String::from_utf8(b.to_vec()).ok())
+                    .collect();
+                info!("2FA response: {:?}", responses);
+
+                let username = responses
+                    .first()
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let password = responses
+                    .get(1)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                let otp_code = responses
+                    .get(2)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
+                if let Some(creds) = self.users.get(&username) {
+                    let ref_code = match creds.two_factor_code.as_ref() {
+                        Some(key) => TOTPBuilder::new().base32_key(key).finalize()?.generate(),
+                        None => "".to_string(),
+                    };
+                    if password != creds.password {
+                        error!("Invalid password provided by user {}", user);
+                        return Ok(Auth::Reject {
+                            proceed_with_methods: None,
+                        });
+                    }
+                    if otp_code != ref_code {
+                        error!("Invalid 2FA code provided by user {}", user);
+                        return Ok(Auth::Reject {
+                            proceed_with_methods: None,
+                        });
+                    }
+                    info!("2FA accepted for user {}", user);
+                    return Ok(Auth::Accept);
                 }
             }
             error!("User {} not found in keyboard interactive auth", user);

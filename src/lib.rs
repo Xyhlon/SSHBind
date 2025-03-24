@@ -6,6 +6,7 @@ use std::thread;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
+use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
 use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
 use libreauth::oath::TOTPBuilder;
 use std::collections::{BTreeMap, HashMap};
@@ -14,6 +15,44 @@ use tokio::net::{TcpListener, TcpStream};
 
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
+
+pub struct TotpPromptHandler {
+    creds: Creds,
+}
+
+impl KeyboardInteractivePrompt for TotpPromptHandler {
+    fn prompt(
+        &mut self,
+        username: &str,
+        instructions: &str,
+        prompts: &[Prompt<'_>],
+    ) -> Vec<String> {
+        info!("Keyboard Authenticating user: {}", username);
+        if !instructions.is_empty() {
+            info!("Instructions: {}", instructions);
+        }
+        let _ = self.creds.clone();
+
+        let mut responses = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            // Print the prompt text and flush to ensure it appears before input.
+            info!("{}", prompt.text);
+            let code = TOTPBuilder::new()
+                .base32_key(&self.creds.totp_key.clone().unwrap_or("".to_string()))
+                .finalize()
+                .expect("Failed to build totp builder")
+                .generate();
+            let response = match prompt.text.to_lowercase() {
+                s if s.contains("user") => self.creds.username.clone(),
+                s if s.contains("pass") => self.creds.password.clone(),
+                s if (s.contains("otp") || s.contains("2fa")) => code,
+                _ => "".into(),
+            };
+            responses.push(response);
+        }
+        responses
+    }
+}
 
 /// Authenticates a user for the given SSH session.
 ///
@@ -39,13 +78,20 @@ async fn userauth(
     let password = creds.password.clone();
     let totp_key = creds.totp_key.clone();
 
-    if let Some(key) = totp_key {
-        let _code = TOTPBuilder::new().base32_key(&key).finalize()?.generate();
-        // Use the generated TOTP code as needed
-    }
+    if totp_key.is_some() {
+        let mut prompter = TotpPromptHandler {
+            creds: creds.clone(),
+        };
 
-    info!("Authenticating with: {}", username);
-    session.userauth_password(&username, &password).await?;
+        session
+            .userauth_keyboard_interactive(&username, &mut prompter)
+            .await?;
+
+        // Use the generated TOTP code as needed
+    } else {
+        info!("Authenticating with: {}", username);
+        session.userauth_password(&username, &password).await?;
+    }
 
     if session.authenticated() {
         info!("SSH session established and authenticated!");
