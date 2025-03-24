@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::error::Error;
+use std::fmt;
 use std::net::ToSocketAddrs;
 use std::process::Command;
+use std::str::FromStr;
 use std::thread;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +56,63 @@ impl KeyboardInteractivePrompt for TotpPromptHandler {
     }
 }
 
+/// Represents the standard SSH authentication methods.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum AuthMethod {
+    Password,
+    KeyboardInteractive,
+    PublicKey,
+    HostBased,
+    GssapiWithMic,
+}
+
+impl FromStr for AuthMethod {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "password" => Ok(AuthMethod::Password),
+            "keyboard-interactive" => Ok(AuthMethod::KeyboardInteractive),
+            "publickey" => Ok(AuthMethod::PublicKey),
+            "hostbased" => Ok(AuthMethod::HostBased),
+            "gssapi-with-mic" => Ok(AuthMethod::GssapiWithMic),
+            _ => Err(()),
+        }
+    }
+}
+
+impl fmt::Display for AuthMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let method = match self {
+            AuthMethod::Password => "password",
+            AuthMethod::KeyboardInteractive => "keyboard-interactive",
+            AuthMethod::PublicKey => "publickey",
+            AuthMethod::HostBased => "hostbased",
+            AuthMethod::GssapiWithMic => "gssapi-with-mic",
+        };
+        write!(f, "{}", method)
+    }
+}
+
+/// A parser that preserves the ordering of the allowed authentication methods.
+#[derive(Debug)]
+struct OrderedAuthMethods {
+    methods: Vec<AuthMethod>,
+}
+
+impl OrderedAuthMethods {
+    /// Parse a comma-separated list of methods (e.g. "password,publickey,hostbased,keyboard-interactive")
+    /// into an OrderedAuthMethods instance that preserves ordering.
+    fn parse(methods_str: &str) -> Self {
+        // Split the input string and convert each method into an AuthMethod.
+        // Filtering out unsupported ones.
+        let methods: Vec<AuthMethod> = methods_str
+            .split(',')
+            .filter_map(|m| AuthMethod::from_str(m).ok())
+            .collect();
+        OrderedAuthMethods { methods }
+    }
+}
+
 /// Authenticates a user for the given SSH session.
 ///
 /// # Arguments
@@ -78,19 +137,67 @@ async fn userauth(
     let password = creds.password.clone();
     let totp_key = creds.totp_key.clone();
 
-    if totp_key.is_some() {
-        let mut prompter = TotpPromptHandler {
-            creds: creds.clone(),
-        };
+    // Query the allowed methods as a comma-separated string.
+    let auth_methods_str = session.auth_methods(&username).await?;
+    let mut ordered_auth = OrderedAuthMethods::parse(auth_methods_str);
+    info!(
+        "Available authentication methods in order: {:?}",
+        ordered_auth
+    );
 
-        session
-            .userauth_keyboard_interactive(&username, &mut prompter)
-            .await?;
-
-        // Use the generated TOTP code as needed
-    } else {
-        info!("Authenticating with: {}", username);
-        session.userauth_password(&username, &password).await?;
+    // Continue while there are methods to try and the session isn't authenticated.
+    while !ordered_auth.methods.is_empty() && !session.authenticated() {
+        // Remove the first (preferred) method.
+        let method = ordered_auth.methods.remove(0);
+        match method {
+            AuthMethod::Password => {
+                let result = session.userauth_password(&username, &password).await;
+                match result {
+                    Ok(_) if session.authenticated() => {
+                        info!("Authenticated via password.");
+                        break;
+                    }
+                    Ok(_) => {
+                        info!("Password authentication succeeded partially.");
+                        // Reparse to get the updated list of allowed methods.
+                        let new_auth_methods = session.auth_methods(&username).await?;
+                        ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
+                        info!("Updated authentication methods: {:?}", ordered_auth);
+                    }
+                    Err(e) => match totp_key {
+                        // this seems hacky but currently the only way to handle partial auth
+                        Some(_) => {
+                            info!("Probably partial auth: {:?}", e);
+                            ordered_auth =
+                                OrderedAuthMethods::parse(session.auth_methods(&username).await?);
+                            ordered_auth.methods.retain(|m| *m != AuthMethod::Password);
+                            info!(
+                                "Available authentication methods in order: {:?}",
+                                ordered_auth
+                            );
+                        }
+                        None => {
+                            error!("Password authentication failed: {:?}", e);
+                        }
+                    },
+                }
+            }
+            AuthMethod::KeyboardInteractive => {
+                let mut prompter = TotpPromptHandler {
+                    creds: creds.clone(),
+                };
+                session
+                    .userauth_keyboard_interactive(&username, &mut prompter)
+                    .await?;
+                if session.authenticated() {
+                    info!("Authenticated via keyboard-interactive.");
+                    break;
+                }
+            }
+            _ => {
+                info!("Skipping unsupported method: {}", method);
+            }
+        }
     }
 
     if session.authenticated() {
