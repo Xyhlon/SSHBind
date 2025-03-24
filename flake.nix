@@ -202,6 +202,7 @@
           pkgs.age
           pkgs.statix
           pkgs.gdb
+          pkgs.ltex-ls
           # pkgs.ripgrep
         ];
       };
