@@ -1,0 +1,76 @@
+name: ci
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+jobs:
+  test:
+    name: Test on ${{ matrix.os }} / Rust ${{ matrix.rust }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        rust: [stable, beta, nightly]
+    steps:
+      - name: Install system dependencies on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+      - name: Install SOPS on Linux
+        if: runner.os == 'Linux'
+        env:
+          SOPS_VERSION: "v3.9.4"
+        run: |
+          curl -L -o /tmp/sops https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.amd64
+          sudo install -m 0755 /tmp/sops /usr/local/bin/sops
+          sops --version
+      - name: Install system dependencies on macOS
+        if: runner.os == 'macOS'
+        run: brew update && brew install sops
+      - name: Install system dependencies on Windows
+        if: runner.os == 'Windows'
+        run: choco install sops -y
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+      - name: Install cargo-nextest
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: cargo-nextest
+          locked: true
+      - name: Run cargo build
+        run: cargo +${{ matrix.rust }} build --all-features --verbose
+      - name: Run cargo test
+        run: cargo +${{ matrix.rust }} nextest run --all-features --verbose
+  formatting:
+    name: Cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Update Rust
+        run: rustup update stable
+      - name: Run cargo fmt
+        run: cargo +stable fmt --all -- --check
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Update Rust
+        run: rustup update stable
+      - name: Run clippy
+        run: cargo +stable clippy --all-features
+  cargo-deny:
+    name: Check dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@v2

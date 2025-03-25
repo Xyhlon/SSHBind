@@ -53,6 +53,8 @@ pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
 
     let enc_content = String::from_utf8_lossy(&output.stdout).to_string();
     fs::write(&file_path, enc_content).expect("Failed to write to file");
+
+    info!("Temp Credential Directory prepared");
     tmp_dir
 }
 
