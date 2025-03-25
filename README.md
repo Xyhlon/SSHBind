@@ -1,5 +1,10 @@
 # SSHBind
 
+[![Build Status](https://github.com/Xyhlon/SSHBind/actions/workflows/ci.yml/badge.svg)](https://github.com/Xyhlon/SSHBind/actions/workflows/ci.yml)
+[![SSHBind on crates.io](https://img.shields.io/crates/v/sshbind.svg)](https://crates.io/crates/sshbind)
+[![SSHBind on docs.rs](https://docs.rs/sshbind/badge.svg)](https://docs.rs/sshbind/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://www.tldrlegal.com/license/mit-license)
+
 SSHBind is a Rust library that enables developers to programmatically bind services
 located behind multiple SSH connections to a local socket. This facilitates secure and
 seamless access to remote services, even those that are otherwise unreachable.
