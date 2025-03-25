@@ -1,2 +1,13 @@
 [licenses]
-allow = ["MIT", "Apache-2.0", "BSD-3-Clause", "Unicode-3.0", "CECILL-C"]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+  "CECILL-C",
+  "MPL-2.0",
+]
+[advisories]
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "This vulnerability is due to testing dependency is not included in the library." },
+]

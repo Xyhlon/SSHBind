@@ -174,6 +174,7 @@ async fn userauth(
                             ordered_auth =
                                 OrderedAuthMethods::parse(session.auth_methods(&username).await?);
                             ordered_auth.methods.retain(|m| *m != AuthMethod::Password);
+                            ordered_auth.methods.retain(|m| *m != AuthMethod::PublicKey);
                             info!(
                                 "Available authentication methods in order: {:?}",
                                 ordered_auth

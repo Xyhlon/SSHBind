@@ -85,6 +85,14 @@
       # all of that work (e.g. via cachix) when running in CI
       cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
+      overlay = final: prev: {
+        sshbind = craneLib.buildPackage (commonArgs
+          // {
+            inherit cargoArtifacts;
+            doCheck = false;
+          });
+      };
+
       # Build the actual crate itself, reusing the dependency
       # artifacts from above.
       sshbind = craneLib.buildPackage (commonArgs
@@ -187,6 +195,8 @@
 
       formatter = pkgs.alejandra;
 
+      overlays = overlay;
+
       devShells.default = craneLib.devShell {
         # Inherit inputs from checks.
         checks = self.checks.${system};
@@ -197,6 +207,7 @@
 
         # Extra inputs can be added here; cargo and rustc are provided by default.
         packages = [
+          self.packages.${system}.default
           pkgs.openssl
           pkgs.sops
           pkgs.age
