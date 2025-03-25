@@ -11,7 +11,10 @@ use tokio_util::sync::CancellationToken;
 use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
 use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
 use libreauth::oath::TOTPBuilder;
+use ssh2_config::{ParseRule, SshConfig};
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::BufReader;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -192,6 +195,47 @@ async fn userauth(
                 if session.authenticated() {
                     info!("Authenticated via keyboard-interactive.");
                     break;
+                }
+            }
+            AuthMethod::PublicKey => {
+                info!("Attempting public key authentication via ssh config.");
+
+                // Read and parse the SSH configuration from ~/.ssh/config.
+                let home = dirs::home_dir().ok_or("No home directory found")?;
+                let config_path = home.join(".ssh/config");
+                let file = File::open(&config_path)
+                    .map_err(|e| format!("Failed to open SSH config: {}", e))?;
+                let mut reader = BufReader::new(file);
+                let config = SshConfig::default()
+                    .parse(&mut reader, ParseRule::STRICT)
+                    .map_err(|e| format!("Failed to parse SSH config: {:?}", e))?;
+
+                // Query the config for this host.
+                let hostname = host.split(':').next().expect("Hostname could have a port");
+                let host_params = config.query(hostname);
+                if let Some(identity_files) = host_params.identity_file {
+                    info!("Found IdentityFile in config: {:?}", identity_files);
+                    // Use the identity file for public key authentication.
+                    // (Adjust the API call if async_ssh2_lite has a different signature.)
+                    let identity_file = identity_files.first().expect("No identity files found");
+                    session
+                        .userauth_pubkey_file(
+                            &username,
+                            Some(identity_file),
+                            identity_file,
+                            None, // Optionally supply a passphrase here
+                        )
+                        .await?;
+                    if session.authenticated() {
+                        info!("Authenticated via public key.");
+                        break;
+                    } else {
+                        warn!("Public key authentication failed.");
+                        let new_auth_methods = session.auth_methods(&username).await?;
+                        ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
+                    }
+                } else {
+                    warn!("No IdentityFile found in SSH config for host {}", host);
                 }
             }
             _ => {
