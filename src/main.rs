@@ -21,6 +21,7 @@ enum DaemonCommand {
         jump_hosts: Vec<String>,
         remote: String,
         sopsfile: String,
+        cmd: Option<String>,
     },
     Unbind {
         addr: String,
@@ -73,6 +74,10 @@ enum Commands {
         /// Path to the SOPS-encrypted YAML file containing SSH credentials.
         #[arg(short, long)]
         sopsfile: String,
+
+        /// Command to run on the remote server in order to start a service (optional).
+        #[arg(short, long)]
+        cmd: Option<String>,
     },
     /// Unbind the binding for the given address.
     Unbind {
@@ -227,6 +232,7 @@ fn handle_client<T: Read + Write>(mut stream: T) {
             jump_hosts,
             remote,
             sopsfile,
+            cmd,
         } => {
             // Here you would add the binding details to your daemon's state.
             // For now, we simply return a success message.
@@ -244,7 +250,7 @@ fn handle_client<T: Read + Write>(mut stream: T) {
                 },
             );
 
-            sshbind::bind(&addr, jump_hosts, &remote, &sopsfile);
+            sshbind::bind(&addr, jump_hosts, &remote, &sopsfile, cmd);
             DaemonResponse::Success(format!("Bound at {}", addr))
         }
         DaemonCommand::Unbind { addr } => {
@@ -424,16 +430,18 @@ fn main() {
             jump_host,
             remote,
             sopsfile,
+            cmd,
         }) => {
             spawn_daemon_if_needed();
-            let cmd = DaemonCommand::Bind {
+            let command = DaemonCommand::Bind {
                 addr,
                 jump_hosts: jump_host,
                 remote,
                 sopsfile,
+                cmd,
             };
             println!("Sending");
-            match send_command(cmd) {
+            match send_command(command) {
                 Ok(DaemonResponse::Success(msg)) => println!("{}", msg),
                 Ok(resp) => println!("Unexpected response: {:?}", resp),
                 Err(e) => eprintln!("{}", e),
