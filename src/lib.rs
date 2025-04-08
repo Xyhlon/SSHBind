@@ -350,6 +350,7 @@ async fn run_server(
     addr: &str,
     jump_hosts: Vec<String>,
     remote_addr: &str,
+    cmd: Option<&str>,
     creds: YamlCreds,
     cancel_token: CancellationToken,
     pair: Arc<(Mutex<bool>, Condvar)>,
@@ -363,6 +364,7 @@ async fn run_server(
         // We notify the condvar that the value has changed.
         cvar.notify_one();
     }
+    let mut once_guard = false;
 
     loop {
         tokio::select! {
@@ -385,6 +387,12 @@ async fn run_server(
                             let session = connect_chain(&jump_hosts, &creds).await?;
                             let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
                             let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+                            if  !once_guard {
+                                if let Some(cmd) = cmd {
+                                    channel.exec(cmd).await?;
+                                }
+                                once_guard = true;
+                            }
                             tokio::spawn(async move {
                                 if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
                                     error!("Connection error: {e}");
@@ -472,7 +480,13 @@ fn find_sops_binary() -> Result<String, String> {
 /// ```
 ///
 /// Note: Ensure that the `sops` command-line tool is installed and accessible in the system's PATH.
-pub fn bind(addr: &str, jump_hosts: Vec<String>, remote_addr: &str, sopsfile: &str) {
+pub fn bind(
+    addr: &str,
+    jump_hosts: Vec<String>,
+    remote_addr: &str,
+    sopsfile: &str,
+    cmd: Option<String>,
+) {
     // Check for the `sops` binary
     let sops_path = match find_sops_binary() {
         Ok(path) => {
@@ -529,6 +543,7 @@ pub fn bind(addr: &str, jump_hosts: Vec<String>, remote_addr: &str, sopsfile: &s
                 &bind_addr,
                 jump_hosts,
                 &remote_addr,
+                cmd.as_deref(),
                 creds,
                 token_clone,
                 pair_clone,
