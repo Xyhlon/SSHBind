@@ -33,7 +33,7 @@ fn fail_not_path() {
     let jump_hosts = vec!["127.0.0.1:20".to_string()];
     let service_addr = Some("127.0.0.1:8080".to_string());
 
-    bind(bind_addr, jump_hosts, service_addr, "aq^fasdfs*$%");
+    bind(bind_addr, jump_hosts, service_addr, "aq^fasdfs*$%", None);
     unbind(bind_addr);
 }
 
@@ -130,6 +130,7 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
         jump_hosts,
         service_addr,
         sopsfile_path.to_str().unwrap(),
+        None,
     );
 
     info!("Bind started");
@@ -239,6 +240,7 @@ async fn serial_integration_test_correct_configuration_multiple(
         jump_hosts,
         service_addr,
         sopsfile_path.to_str().unwrap(),
+        None,
     );
 
     let mut conn = TcpStream::connect(bind_addr).await.unwrap();
@@ -355,6 +357,7 @@ async fn serial_integration_test_second_server_wrong_credentials(
         jump_hosts,
         service_addr,
         sopsfile_path.to_str().unwrap(),
+        None,
     );
 
     let mut conn = TcpStream::connect(bind_addr).await.unwrap();
@@ -449,6 +452,7 @@ async fn serial_integration_test_correct_configuration_2fa(
         jump_hosts,
         service_addr,
         sopsfile_path.to_str().unwrap(),
+        None,
     );
 
     let mut conn = TcpStream::connect(bind_addr).await.unwrap();
