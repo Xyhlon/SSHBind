@@ -53,6 +53,8 @@ pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
 
     let enc_content = String::from_utf8_lossy(&output.stdout).to_string();
     fs::write(&file_path, enc_content).expect("Failed to write to file");
+
+    info!("Temp Credential Directory prepared");
     tmp_dir
 }
 
@@ -169,6 +171,7 @@ impl Handler for SSHServer {
             error!("Password authentication rejected for user: {}", user);
             Ok(Auth::Reject {
                 proceed_with_methods: None,
+                partial_success: false,
             })
         }
     }
@@ -200,6 +203,7 @@ impl Handler for SSHServer {
             error!("Public key authentication rejected for user: {}", user);
             Ok(Auth::Reject {
                 proceed_with_methods: None,
+                partial_success: false,
             })
         }
     }
@@ -256,12 +260,14 @@ impl Handler for SSHServer {
                         error!("Invalid password provided by user {}", user);
                         return Ok(Auth::Reject {
                             proceed_with_methods: None,
+                            partial_success: false,
                         });
                     }
                     if otp_code != ref_code {
                         error!("Invalid 2FA code provided by user {}", user);
                         return Ok(Auth::Reject {
                             proceed_with_methods: None,
+                            partial_success: false,
                         });
                     }
 
@@ -308,12 +314,14 @@ impl Handler for SSHServer {
                         error!("Invalid password provided by user {}", user);
                         return Ok(Auth::Reject {
                             proceed_with_methods: None,
+                            partial_success: false,
                         });
                     }
                     if otp_code != ref_code {
                         error!("Invalid 2FA code provided by user {}", user);
                         return Ok(Auth::Reject {
                             proceed_with_methods: None,
+                            partial_success: false,
                         });
                     }
                     info!("2FA accepted for user {}", user);
@@ -323,6 +331,7 @@ impl Handler for SSHServer {
             error!("User {} not found in keyboard interactive auth", user);
             Ok(Auth::Reject {
                 proceed_with_methods: None,
+                partial_success: false,
             })
         }
     }

@@ -1,4 +1,5 @@
 use env_logger::Builder;
+use log::info;
 use log::LevelFilter;
 use russh::server::Server;
 use serial_test::serial;
@@ -12,6 +13,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
 
 mod helpers;
+
+#[cfg(windows)]
+const FAST_RSA_KEY_SIZE: usize = 1024;
 
 // Ensure the logger is initialized only once
 static LOGGER: LazyLock<()> = LazyLock::new(|| {
@@ -66,13 +70,23 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
     let tmp_dir = helpers::setup_sopsfile(testcreds.clone());
     let sopsfile_path = tmp_dir.path().join("secrets.yaml");
     let mut config = russh::server::Config::default();
-
     // Use OsRng from rand for randomness.
     use russh::keys::ssh_key::rand_core::OsRng;
     let mut rng = OsRng;
-    use russh::keys::Algorithm;
-    let pk = russh::keys::PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
-    config.keys.push(pk);
+
+    #[cfg(unix)]
+    {
+        use russh::keys::Algorithm;
+        let pk = russh::keys::PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        config.keys.push(pk);
+    }
+    #[cfg(windows)]
+    {
+        use russh::keys::ssh_key::private::{KeypairData, RsaKeypair};
+        let keypair = KeypairData::from(RsaKeypair::random(&mut rng, FAST_RSA_KEY_SIZE).unwrap());
+        let pk = russh::keys::PrivateKey::new(keypair, "").unwrap();
+        config.keys.push(pk);
+    }
     let config = Arc::new(config);
     use helpers::Credentials;
     let mut hosts_users: HashMap<String, HashMap<String, Credentials>> = HashMap::new();
@@ -81,6 +95,7 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
         map.insert(v.username.clone(), Credentials::from(v.clone()));
         hosts_users.insert(k.to_string(), map);
     });
+    info!("Prepared SSH server configuration");
 
     let bind_addr = "127.0.0.1:7000";
     let jump_hosts = vec!["127.0.0.1:2222".to_string(), "127.0.0.1:2323".to_string()];
@@ -99,6 +114,7 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
             })
         })
         .collect();
+    info!("SSH servers started");
     let service_handle = task::spawn(async move {
         let serv = TcpListener::bind(service_addr).await.unwrap();
         loop {
@@ -106,6 +122,7 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
             socket.write_all(b"hello world!").await.unwrap();
         }
     });
+    info!("Service started");
 
     bind(
         bind_addr,
@@ -114,6 +131,7 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
         sopsfile_path.to_str().unwrap(),
     );
 
+    info!("Bind started");
     let mut conn = TcpStream::connect(bind_addr).await.unwrap();
     let mut buf = vec![0; 1024];
     let n = conn.read(&mut buf).await?;
@@ -163,13 +181,23 @@ async fn serial_integration_test_correct_configuration_multiple(
     let tmp_dir = helpers::setup_sopsfile(testcreds.clone());
     let sopsfile_path = tmp_dir.path().join("secrets.yaml");
     let mut config = russh::server::Config::default();
-
     // Use OsRng from rand for randomness.
     use russh::keys::ssh_key::rand_core::OsRng;
     let mut rng = OsRng;
-    use russh::keys::Algorithm;
-    let pk = russh::keys::PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
-    config.keys.push(pk);
+
+    #[cfg(unix)]
+    {
+        use russh::keys::Algorithm;
+        let pk = russh::keys::PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        config.keys.push(pk);
+    }
+    #[cfg(windows)]
+    {
+        use russh::keys::ssh_key::private::{KeypairData, RsaKeypair};
+        let keypair = KeypairData::from(RsaKeypair::random(&mut rng, FAST_RSA_KEY_SIZE).unwrap());
+        let pk = russh::keys::PrivateKey::new(keypair, "").unwrap();
+        config.keys.push(pk);
+    }
     let config = Arc::new(config);
     use helpers::Credentials;
     let mut hosts_users: HashMap<String, HashMap<String, Credentials>> = HashMap::new();
@@ -267,13 +295,23 @@ async fn serial_integration_test_second_server_wrong_credentials(
     let tmp_dir = helpers::setup_sopsfile(testcreds.clone());
     let sopsfile_path = tmp_dir.path().join("secrets.yaml");
     let mut config = russh::server::Config::default();
-
     // Use OsRng from rand for randomness.
     use russh::keys::ssh_key::rand_core::OsRng;
     let mut rng = OsRng;
-    use russh::keys::Algorithm;
-    let pk = russh::keys::PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
-    config.keys.push(pk);
+
+    #[cfg(unix)]
+    {
+        use russh::keys::Algorithm;
+        let pk = russh::keys::PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        config.keys.push(pk);
+    }
+    #[cfg(windows)]
+    {
+        use russh::keys::ssh_key::private::{KeypairData, RsaKeypair};
+        let keypair = KeypairData::from(RsaKeypair::random(&mut rng, FAST_RSA_KEY_SIZE).unwrap());
+        let pk = russh::keys::PrivateKey::new(keypair, "").unwrap();
+        config.keys.push(pk);
+    }
     let config = Arc::new(config);
     use helpers::Credentials;
     let mut hosts_users: HashMap<String, HashMap<String, Credentials>> = HashMap::new();
@@ -349,13 +387,23 @@ async fn serial_integration_test_correct_configuration_2fa(
     let tmp_dir = helpers::setup_sopsfile(testcreds.clone());
     let sopsfile_path = tmp_dir.path().join("secrets.yaml");
     let mut config = russh::server::Config::default();
-
     // Use OsRng from rand for randomness.
     use russh::keys::ssh_key::rand_core::OsRng;
     let mut rng = OsRng;
-    use russh::keys::Algorithm;
-    let pk = russh::keys::PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
-    config.keys.push(pk);
+
+    #[cfg(unix)]
+    {
+        use russh::keys::Algorithm;
+        let pk = russh::keys::PrivateKey::random(&mut rng, Algorithm::Ed25519).unwrap();
+        config.keys.push(pk);
+    }
+    #[cfg(windows)]
+    {
+        use russh::keys::ssh_key::private::{KeypairData, RsaKeypair};
+        let keypair = KeypairData::from(RsaKeypair::random(&mut rng, FAST_RSA_KEY_SIZE).unwrap());
+        let pk = russh::keys::PrivateKey::new(keypair, "").unwrap();
+        config.keys.push(pk);
+    }
     let config = Arc::new(config);
     use helpers::Credentials;
     let mut hosts_users: HashMap<String, HashMap<String, Credentials>> = HashMap::new();
@@ -413,3 +461,34 @@ async fn serial_integration_test_correct_configuration_2fa(
     service_handle.abort();
     Ok(())
 }
+
+// #[tokio::test]
+// #[serial]
+// async fn serial_integration_test_correct_configuration_2fa_aug(
+// ) -> Result<(), Box<dyn std::error::Error>> {
+//     #[allow(clippy::let_unit_value)]
+//     let _ = *LOGGER; // Ensure logger is initialized
+//     let bind_addr = "127.0.0.1:7000";
+//     let jump_hosts = vec![
+//         "gate.mpcdf.mpg.de:22".to_string(),
+//         "toki01.bc.rzg.mpg.de:22".to_string(),
+//     ];
+//     let service_addr = "httpforever.com:80";
+//
+//     bind(
+//         bind_addr,
+//         jump_hosts,
+//         service_addr,
+//         "../tokadata-python-template/tests/creds/aug.yaml",
+//     );
+//
+//     let mut conn = TcpStream::connect(bind_addr).await.unwrap();
+//     let mut buf = vec![0; 1024];
+//     let n = conn.read(&mut buf).await?;
+//     let response = String::from_utf8_lossy(&buf[..n]).to_string();
+//     println!("Received: {}", response);
+//     assert_eq!(response, "hello world!");
+//
+//     unbind(bind_addr);
+//     Ok(())
+// }

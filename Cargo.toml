@@ -1,6 +1,6 @@
 [package]
 name = "sshbind"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 license = "MIT"
 authors = ["Maximilian Philipp <maxkon2000@gmail.com>"]
@@ -15,12 +15,14 @@ documentation = "https://docs.rs/sshbind"
 [dependencies]
 async-ssh2-lite = { version = "0.5.0", features = ["tokio"] }
 clap = { version = "4.5.32", features = ["derive"] }
+dirs = "6.0.0"
 env_logger = "0.11.6"
 libreauth = "0.17.0"
 log = "0.4.26"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.140"
 serde_yml = "0.0.12"
+ssh2-config = "0.5.4"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7.13"
 
@@ -29,7 +31,7 @@ secrecy = "0.10.3"
 age = "0.11.1"
 tempfile = "3.17.1"
 tokio = { version = "1", features = ["full"] }
-russh = "0.50.4"
+russh = "0.51.1"
 async-trait = "0.1.86"
 log = "0.4.26"
 env_logger = "0.11.6"

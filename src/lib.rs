@@ -11,7 +11,10 @@ use tokio_util::sync::CancellationToken;
 use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
 use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
 use libreauth::oath::TOTPBuilder;
+use ssh2_config::{ParseRule, SshConfig};
 use std::collections::{BTreeMap, HashMap};
+use std::fs::File;
+use std::io::BufReader;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -171,6 +174,7 @@ async fn userauth(
                             ordered_auth =
                                 OrderedAuthMethods::parse(session.auth_methods(&username).await?);
                             ordered_auth.methods.retain(|m| *m != AuthMethod::Password);
+                            ordered_auth.methods.retain(|m| *m != AuthMethod::PublicKey);
                             info!(
                                 "Available authentication methods in order: {:?}",
                                 ordered_auth
@@ -192,6 +196,47 @@ async fn userauth(
                 if session.authenticated() {
                     info!("Authenticated via keyboard-interactive.");
                     break;
+                }
+            }
+            AuthMethod::PublicKey => {
+                info!("Attempting public key authentication via ssh config.");
+
+                // Read and parse the SSH configuration from ~/.ssh/config.
+                let home = dirs::home_dir().ok_or("No home directory found")?;
+                let config_path = home.join(".ssh/config");
+                let file = File::open(&config_path)
+                    .map_err(|e| format!("Failed to open SSH config: {}", e))?;
+                let mut reader = BufReader::new(file);
+                let config = SshConfig::default()
+                    .parse(&mut reader, ParseRule::STRICT)
+                    .map_err(|e| format!("Failed to parse SSH config: {:?}", e))?;
+
+                // Query the config for this host.
+                let hostname = host.split(':').next().expect("Hostname could have a port");
+                let host_params = config.query(hostname);
+                if let Some(identity_files) = host_params.identity_file {
+                    info!("Found IdentityFile in config: {:?}", identity_files);
+                    // Use the identity file for public key authentication.
+                    // (Adjust the API call if async_ssh2_lite has a different signature.)
+                    let identity_file = identity_files.first().expect("No identity files found");
+                    session
+                        .userauth_pubkey_file(
+                            &username,
+                            Some(identity_file),
+                            identity_file,
+                            None, // Optionally supply a passphrase here
+                        )
+                        .await?;
+                    if session.authenticated() {
+                        info!("Authenticated via public key.");
+                        break;
+                    } else {
+                        warn!("Public key authentication failed.");
+                        let new_auth_methods = session.auth_methods(&username).await?;
+                        ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
+                    }
+                } else {
+                    warn!("No IdentityFile found in SSH config for host {}", host);
                 }
             }
             _ => {
@@ -305,6 +350,7 @@ async fn run_server(
     addr: &str,
     jump_hosts: Vec<String>,
     remote_addr: &str,
+    cmd: Option<&str>,
     creds: YamlCreds,
     cancel_token: CancellationToken,
     pair: Arc<(Mutex<bool>, Condvar)>,
@@ -318,6 +364,7 @@ async fn run_server(
         // We notify the condvar that the value has changed.
         cvar.notify_one();
     }
+    let mut once_guard = false;
 
     loop {
         tokio::select! {
@@ -340,6 +387,12 @@ async fn run_server(
                             let session = connect_chain(&jump_hosts, &creds).await?;
                             let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
                             let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+                            if  !once_guard {
+                                if let Some(cmd) = cmd {
+                                    channel.exec(cmd).await?;
+                                }
+                                once_guard = true;
+                            }
                             tokio::spawn(async move {
                                 if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
                                     error!("Connection error: {e}");
@@ -427,7 +480,13 @@ fn find_sops_binary() -> Result<String, String> {
 /// ```
 ///
 /// Note: Ensure that the `sops` command-line tool is installed and accessible in the system's PATH.
-pub fn bind(addr: &str, jump_hosts: Vec<String>, remote_addr: &str, sopsfile: &str) {
+pub fn bind(
+    addr: &str,
+    jump_hosts: Vec<String>,
+    remote_addr: &str,
+    sopsfile: &str,
+    cmd: Option<String>,
+) {
     // Check for the `sops` binary
     let sops_path = match find_sops_binary() {
         Ok(path) => {
@@ -484,6 +543,7 @@ pub fn bind(addr: &str, jump_hosts: Vec<String>, remote_addr: &str, sopsfile: &s
                 &bind_addr,
                 jump_hosts,
                 &remote_addr,
+                cmd.as_deref(),
                 creds,
                 token_clone,
                 pair_clone,
