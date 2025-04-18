@@ -365,6 +365,7 @@ async fn run_server(
         cvar.notify_one();
     }
     let mut once_guard = false;
+    let mut daemon = false;
 
     loop {
         tokio::select! {
@@ -386,13 +387,32 @@ async fn run_server(
                         else{
                             let session = connect_chain(&jump_hosts, &creds).await?;
                             let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
-                            let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+                            info!("Connected to remote address: {}", remote_addr);
+                            let mut channel  = session.channel_session().await?;
                             if  !once_guard {
                                 if let Some(cmd) = cmd {
                                     channel.exec(cmd).await?;
+                                    let exit_code = channel.exit_status();
+                                    if let Ok(code) = exit_code {
+                                        info!("Command exited with code: {}", code);
+                                    } else {
+                                        error!("Failed to get exit code");
+                                    }
                                 }
-                                once_guard = true;
+                                if daemon {
+                                    channel.send_eof().await?;
+                                    channel.wait_close().await?;
+                                    once_guard = true;
+                                }
+                                tokio::spawn(async move {
+                                    if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
+                                        error!("Connection error: {e}");
+                                    }
+                                });
+                                continue
                             }
+                            info!("Command executed: {}", cmd.unwrap_or("No command provided"));
+                            let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
                             tokio::spawn(async move {
                                 if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
                                     error!("Connection error: {e}");
