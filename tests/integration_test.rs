@@ -30,8 +30,8 @@ fn fail_not_path() {
     #[allow(clippy::let_unit_value)]
     let _ = *LOGGER; // Ensure logger is initialized
     let bind_addr = "127.0.0.1:8000";
-    let jump_hosts = vec!["127.0.0.0:20".to_string()];
-    let service_addr = "127.0.0.0:80";
+    let jump_hosts = vec!["127.0.0.1:20".to_string()];
+    let service_addr = Some("127.0.0.1:8080".to_string());
 
     bind(bind_addr, jump_hosts, service_addr, "aq^fasdfs*$%", None);
     unbind(bind_addr);
@@ -99,7 +99,8 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
 
     let bind_addr = "127.0.0.1:7000";
     let jump_hosts = vec!["127.0.0.1:2222".to_string(), "127.0.0.1:2323".to_string()];
-    let service_addr = "127.0.0.1:8080";
+    let service_addr_consume = "127.0.0.1:8080".to_string();
+    let service_addr = Some(service_addr_consume.clone());
 
     let ssh_tasks: Vec<_> = jump_hosts
         .clone()
@@ -116,7 +117,7 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
         .collect();
     info!("SSH servers started");
     let service_handle = task::spawn(async move {
-        let serv = TcpListener::bind(service_addr).await.unwrap();
+        let serv = TcpListener::bind(service_addr_consume).await.unwrap();
         loop {
             let (mut socket, _) = serv.accept().await.unwrap();
             socket.write_all(b"hello world!").await.unwrap();
@@ -210,7 +211,8 @@ async fn serial_integration_test_correct_configuration_multiple(
 
     let bind_addr = "127.0.0.1:7000";
     let jump_hosts = vec!["127.0.0.1:2222".to_string(), "127.0.0.1:2323".to_string()];
-    let service_addr = "127.0.0.1:8080";
+    let service_addr_consume = "127.0.0.1:8080".to_string();
+    let service_addr = Some(service_addr_consume.clone());
 
     let ssh_tasks: Vec<_> = jump_hosts
         .clone()
@@ -226,7 +228,7 @@ async fn serial_integration_test_correct_configuration_multiple(
         })
         .collect();
     let service_handle = task::spawn(async move {
-        let serv = TcpListener::bind(service_addr).await.unwrap();
+        let serv = TcpListener::bind(service_addr_consume).await.unwrap();
         loop {
             let (mut socket, _) = serv.accept().await.unwrap();
             socket.write_all(b"hello world!").await.unwrap();
@@ -325,7 +327,8 @@ async fn serial_integration_test_second_server_wrong_credentials(
 
     let bind_addr = "127.0.0.1:7000";
     let jump_hosts = vec!["127.0.0.1:2222".to_string(), "127.0.0.1:2323".to_string()];
-    let service_addr = "127.0.0.1:8080";
+    let service_addr_consume = "127.0.0.1:8080".to_string();
+    let service_addr = Some(service_addr_consume.clone());
 
     let ssh_tasks: Vec<_> = jump_hosts
         .clone()
@@ -342,7 +345,7 @@ async fn serial_integration_test_second_server_wrong_credentials(
         })
         .collect();
     let service_handle = task::spawn(async move {
-        let serv = TcpListener::bind(service_addr).await.unwrap();
+        let serv = TcpListener::bind(service_addr_consume).await.unwrap();
         loop {
             let (mut socket, _) = serv.accept().await.unwrap();
             socket.write_all(b"hello world!").await.unwrap();
@@ -420,7 +423,8 @@ async fn serial_integration_test_correct_configuration_2fa(
 
     let bind_addr = "127.0.0.1:7000";
     let jump_hosts = vec!["127.0.0.1:2222".to_string()];
-    let service_addr = "127.0.0.1:8080";
+    let service_addr_consume = "127.0.0.1:8080".to_string();
+    let service_addr = Some(service_addr_consume.clone());
 
     let ssh_tasks: Vec<_> = jump_hosts
         .clone()
@@ -436,7 +440,7 @@ async fn serial_integration_test_correct_configuration_2fa(
         })
         .collect();
     let service_handle = task::spawn(async move {
-        let serv = TcpListener::bind(service_addr).await.unwrap();
+        let serv = TcpListener::bind(service_addr_consume).await.unwrap();
         loop {
             let (mut socket, _) = serv.accept().await.unwrap();
             socket.write_all(b"hello world!").await.unwrap();

@@ -349,7 +349,7 @@ async fn connect_chain(
 async fn run_server(
     addr: &str,
     jump_hosts: Vec<String>,
-    remote_addr: &str,
+    remote_addr: Option<&str>,
     cmd: Option<&str>,
     creds: YamlCreds,
     cancel_token: CancellationToken,
@@ -364,9 +364,6 @@ async fn run_server(
         // We notify the condvar that the value has changed.
         cvar.notify_one();
     }
-    let mut once_guard = false;
-    let mut daemon = false;
-
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -377,7 +374,12 @@ async fn run_server(
                 match result {
                     Ok((mut inbound, _)) => {
                         if jump_hosts.is_empty() {
-                            let mut outbound = TcpStream::connect(remote_addr).await?;
+                            let remote_socket_addr = remote_addr
+                                .ok_or("Remote address is required when no jump hosts are provided")?
+                                .to_socket_addrs()?
+                                .next()
+                                .ok_or("Failed to resolve remote address")?;
+                            let mut outbound = TcpStream::connect(remote_socket_addr).await?;
                             tokio::spawn(async move {
                                 if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
                                     error!("Connection error: {e}");
@@ -386,38 +388,69 @@ async fn run_server(
                         }
                         else{
                             let session = connect_chain(&jump_hosts, &creds).await?;
-                            let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
-                            info!("Connected to remote address: {}", remote_addr);
                             let mut channel  = session.channel_session().await?;
-                            if  !once_guard {
-                                if let Some(cmd) = cmd {
-                                    channel.exec(cmd).await?;
-                                    let exit_code = channel.exit_status();
-                                    if let Ok(code) = exit_code {
-                                        info!("Command exited with code: {}", code);
-                                    } else {
-                                        error!("Failed to get exit code");
-                                    }
-                                }
-                                if daemon {
-                                    channel.send_eof().await?;
-                                    channel.wait_close().await?;
-                                    once_guard = true;
-                                }
-                                tokio::spawn(async move {
-                                    if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                        error!("Connection error: {e}");
-                                    }
-                                });
-                                continue
-                            }
                             info!("Command executed: {}", cmd.unwrap_or("No command provided"));
-                            let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
-                            tokio::spawn(async move {
-                                if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                    error!("Connection error: {e}");
+                            match (cmd, remote_addr) {
+                                (Some(cmd), Some(remote_addr)) => {
+                                    // Execute the command on the remote server and
+                                    // then assume a local socket is opened to which
+                                    // we can connect to on the remote_addr.
+                                    channel.exec(cmd).await?;
+                                    let exit_code = channel.exit_status().expect("Failed to get exit code");
+                                    if exit_code != 0 {
+                                        error!("Command execution failed with exit code: {}", exit_code);
+                                    }
+                                    let remote_socket_addr = remote_addr
+                                        .to_socket_addrs()?
+                                        .next()
+                                        .ok_or("Failed to resolve remote address")?;
+                                    let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+                                    info!("Connected to remote address: {}", remote_addr);
+                                    tokio::spawn(async move {
+                                        if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
+                                            error!("Connection error: {e}");
+                                        }
+                                    });
                                 }
-                            });
+                                (Some(cmd), None) => {
+                                    // Execute the command on the remote server and
+                                    // then assume since no remote_addr is provided
+                                    // that communication is done over via stdio over
+                                    // the channel.
+                                    channel.exec(cmd).await?;
+                                    let exit_code = channel.exit_status().expect("Failed to get exit code");
+                                    if exit_code != 0 {
+                                        error!("Command execution failed with exit code: {}", exit_code);
+                                    }
+                                    tokio::spawn(async move {
+                                        if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
+                                            error!("Connection error: {e}");
+                                        }
+                                    });
+                                    continue;
+                                }
+                                (None, Some(remote_addr)) => {
+                                    // It is assumed that after the jumping through the
+                                    // jump list one is on a host from which the service
+                                    // is reachable and already running.
+                                    let remote_socket_addr = remote_addr
+                                        .to_socket_addrs()?
+                                        .next()
+                                        .ok_or("Failed to resolve remote address")?;
+                                    let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+                                    info!("Connected to remote address: {}", remote_addr);
+                                    tokio::spawn(async move {
+                                        if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
+                                            error!("Connection error: {e}");
+                                        }
+                                    });
+                                    continue
+                                }
+                                (None, None) => {
+                                    error!("Either a command or a remote address must be provided.");
+                                    return Err("Either a command or a remote address must be provided.".into());
+                                }
+                            }
                         }
                     }
                     Err(e) => error!("Failed to accept connection: {e}")
@@ -503,7 +536,7 @@ fn find_sops_binary() -> Result<String, String> {
 pub fn bind(
     addr: &str,
     jump_hosts: Vec<String>,
-    remote_addr: &str,
+    remote_addr: Option<String>,
     sopsfile: &str,
     cmd: Option<String>,
 ) {
@@ -551,7 +584,6 @@ pub fn bind(
     let cancel_token = CancellationToken::new();
     let token_clone = cancel_token.clone();
     let bind_addr = addr.to_string();
-    let remote_addr = remote_addr.to_string();
 
     let pair = Arc::new((Mutex::new(true), Condvar::new()));
     let pair_clone = Arc::clone(&pair);
@@ -562,7 +594,7 @@ pub fn bind(
             if let Err(e) = run_server(
                 &bind_addr,
                 jump_hosts,
-                &remote_addr,
+                remote_addr.as_deref(),
                 cmd.as_deref(),
                 creds,
                 token_clone,
