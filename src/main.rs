@@ -19,7 +19,7 @@ enum DaemonCommand {
     Bind {
         addr: String,
         jump_hosts: Vec<String>,
-        remote: String,
+        remote: Option<String>,
         sopsfile: String,
         cmd: Option<String>,
     },
@@ -43,7 +43,7 @@ enum DaemonResponse {
 struct BindingDetails {
     addr: String,
     jump_hosts: Vec<String>,
-    remote: String,
+    remote: Option<String>,
     timestamp: u64, // seconds since UNIX_EPOCH
 }
 
@@ -69,7 +69,7 @@ enum Commands {
 
         /// The final remote address (e.g., "remote.example.com:80")
         #[arg(short, long)]
-        remote: String,
+        remote: Option<String>,
 
         /// Path to the SOPS-encrypted YAML file containing SSH credentials.
         #[arg(short, long)]
@@ -250,7 +250,7 @@ fn handle_client<T: Read + Write>(mut stream: T) {
                 },
             );
 
-            sshbind::bind(&addr, jump_hosts, &remote, &sopsfile, cmd);
+            sshbind::bind(&addr, jump_hosts, remote, &sopsfile, cmd);
             DaemonResponse::Success(format!("Bound at {}", addr))
         }
         DaemonCommand::Unbind { addr } => {
@@ -488,7 +488,10 @@ fn main() {
                         for b in list {
                             println!(
                                 "{:<20} {:<30} {:<10} {:?}",
-                                b.addr, b.remote, b.timestamp, b.jump_hosts
+                                b.addr,
+                                b.remote.unwrap_or("".to_string()),
+                                b.timestamp,
+                                b.jump_hosts
                             );
                         }
                     }
