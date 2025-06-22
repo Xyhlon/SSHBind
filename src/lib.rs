@@ -201,19 +201,22 @@ async fn userauth(
             AuthMethod::PublicKey => {
                 info!("Attempting public key authentication via ssh config.");
 
-                // Read and parse the SSH configuration from ~/.ssh/config.
-                let home = dirs::home_dir().ok_or("No home directory found")?;
-                let config_path = home.join(".ssh/config");
-                let file = File::open(&config_path)
-                    .map_err(|e| format!("Failed to open SSH config: {}", e))?;
-                let mut reader = BufReader::new(file);
-                let config = SshConfig::default()
-                    .parse(&mut reader, ParseRule::STRICT)
-                    .map_err(|e| format!("Failed to parse SSH config: {:?}", e))?;
+                let host_params = {
+                    // Read and parse the SSH configuration from ~/.ssh/config.
+                    let home = dirs::home_dir().ok_or("No home directory found")?;
+                    let config_path = home.join(".ssh/config");
+                    let file = File::open(&config_path)
+                        .map_err(|e| format!("Failed to open SSH config: {}", e))?;
+                    let mut reader = BufReader::new(file);
+                    let config = SshConfig::default()
+                        .parse(&mut reader, ParseRule::STRICT)
+                        .map_err(|e| format!("Failed to parse SSH config: {:?}", e))?;
 
-                // Query the config for this host.
-                let hostname = host.split(':').next().expect("Hostname could have a port");
-                let host_params = config.query(hostname);
+                    // Query the config for this host.
+                    let hostname = host.split(':').next().expect("Hostname could have a port");
+                    config.query(hostname)
+                };
+
                 if let Some(identity_files) = host_params.identity_file {
                     info!("Found IdentityFile in config: {:?}", identity_files);
                     // Use the identity file for public key authentication.
