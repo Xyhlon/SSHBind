@@ -2,7 +2,8 @@
   description = "";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
 
     crane.url = "github:ipetkov/crane";
 
@@ -19,7 +20,10 @@
       flake = false;
     };
 
-    statix.url = "github:oppiliappan/statix";
+    statix = {
+      url = "github:oppiliappan/statix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     pre-commit-hooks.url = "github:cachix/git-hooks.nix";
   };
@@ -100,6 +104,15 @@
           inherit cargoArtifacts;
           doCheck = false;
         });
+
+      integration_pkgs = import nixpkgs {
+        inherit system;
+        overlays = [
+          overlay
+        ];
+      };
+
+      integrationTests = import ./integration-tests {pkgs = integration_pkgs;};
     in {
       checks = {
         # Build the crate as part of `nix flake check` for convenience
@@ -125,6 +138,7 @@
           };
           configPath = ".pre-commit-config-nix.yaml";
         };
+        inherit (integrationTests) simple;
 
         # Run clippy (and deny all warnings) on the crate source,
         # again, reusing the dependency artifacts from above.
