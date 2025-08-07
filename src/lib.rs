@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::Command;
 use std::str::FromStr;
 use std::thread;
 use tokio::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
+use url::{Host, Url};
 
 use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
 use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
@@ -20,6 +22,57 @@ use tokio::net::{TcpListener, TcpStream};
 
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPort {
+    pub host: String,
+    pub port: u16,
+}
+
+impl TryFrom<&str> for HostPort {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        let url = Url::parse(&format!("ssh://{}", s))
+            .map_err(|e| format!("invalid host:port syntax: {}", e))?;
+
+        let host = url
+            .host()
+            .ok_or_else(|| "missing host".to_string())
+            .map(|h| match h {
+                Host::Domain(d) => d.to_string(),
+                Host::Ipv4(d) => d.to_string(),
+                Host::Ipv6(d) => d.to_string(),
+            })?;
+
+        let port = url.port().ok_or_else(|| "missing port".to_string())?;
+
+        Ok(HostPort { host, port })
+    }
+}
+
+impl FromStr for HostPort {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        HostPort::try_from(s)
+    }
+}
+
+impl fmt::Display for HostPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+impl From<HostPort> for SocketAddr {
+    fn from(hp: HostPort) -> SocketAddr {
+        let s = format!("{}:{}", hp.host, hp.port);
+        s.to_socket_addrs()
+            .expect("Failed to convert HostPort to SocketAddr")
+            .next()
+            .expect("HostPort verified earlier")
+    }
+}
 
 pub struct TotpPromptHandler {
     creds: Creds,
@@ -131,10 +184,10 @@ impl OrderedAuthMethods {
 async fn userauth(
     session: &AsyncSession<TokioTcpStream>,
     creds_map: &YamlCreds,
-    host: &str,
+    host: &HostPort,
 ) -> Result<(), Box<dyn Error>> {
     let creds = creds_map
-        .get(host)
+        .get(&host.to_string())
         .ok_or_else(|| format!("Couldn't find credentials for {}", host))?;
     let username = creds.username.clone();
     let password = creds.password.clone();
@@ -213,8 +266,7 @@ async fn userauth(
                         .map_err(|e| format!("Failed to parse SSH config: {:?}", e))?;
 
                     // Query the config for this host.
-                    let hostname = host.split(':').next().expect("Hostname could have a port");
-                    config.query(hostname)
+                    config.query(&host.host)
                 };
 
                 if let Some(identity_files) = host_params.identity_file {
@@ -274,33 +326,20 @@ async fn userauth(
 /// or an error if the connection fails.
 ///
 async fn connect_chain(
-    jump_hosts: &[String],
+    jump_hosts: &[HostPort],
     creds_map: &YamlCreds,
 ) -> Result<AsyncSession<TokioTcpStream>, Box<dyn Error>> {
     assert!(!jump_hosts.is_empty(), "No jump hosts provided");
     info!("Starting SSH chain connection through {:?}", jump_hosts);
 
-    let jump_socket_addr = jump_hosts[0]
-        .to_socket_addrs()?
-        .next()
-        .ok_or("Failed to resolve address")?;
-
-    let mut session = AsyncSession::<TokioTcpStream>::connect(jump_socket_addr, None).await?;
+    let mut session = AsyncSession::<TokioTcpStream>::connect(jump_hosts[0].clone(), None).await?;
     session.handshake().await?;
     userauth(&session, creds_map, &jump_hosts[0]).await?;
 
     for (i, jump) in jump_hosts.iter().enumerate().skip(1) {
         info!("Connecting through jump {}: {}", i, jump);
-        let jump_socket_addr = jump
-            .to_socket_addrs()?
-            .next()
-            .ok_or("Failed to resolve address")?;
         let mut channel = session
-            .channel_direct_tcpip(
-                &jump_socket_addr.ip().to_string(),
-                jump_socket_addr.port(),
-                None,
-            )
+            .channel_direct_tcpip(&jump.host, jump.port, None)
             .await?;
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -351,8 +390,8 @@ async fn connect_chain(
 ///
 async fn run_server(
     addr: &str,
-    jump_hosts: Vec<String>,
-    remote_addr: Option<&str>,
+    jump_hosts: Vec<HostPort>,
+    remote_addr: Option<HostPort>,
     cmd: Option<&str>,
     creds: YamlCreds,
     cancel_token: CancellationToken,
@@ -367,6 +406,7 @@ async fn run_server(
         // We notify the condvar that the value has changed.
         cvar.notify_one();
     }
+    let remote_addr = remote_addr.as_ref();
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -377,12 +417,13 @@ async fn run_server(
                 match result {
                     Ok((mut inbound, _)) => {
                         if jump_hosts.is_empty() {
-                            let remote_socket_addr = remote_addr
-                                .ok_or("Remote address is required when no jump hosts are provided")?
+                            let socket = remote_addr
+                                .expect("Remote address is required when no jump hosts are provided")
+                                .to_string()
                                 .to_socket_addrs()?
                                 .next()
-                                .ok_or("Failed to resolve remote address")?;
-                            let mut outbound = TcpStream::connect(remote_socket_addr).await?;
+                                .expect("Failed to resolve remote address");
+                            let mut outbound = TcpStream::connect(socket).await?;
                             tokio::spawn(async move {
                                 if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
                                     error!("Connection error: {e}");
@@ -391,23 +432,21 @@ async fn run_server(
                         }
                         else{
                             let session = connect_chain(&jump_hosts, &creds).await?;
-                            let mut channel  = session.channel_session().await?;
+                            info!("SSH session established");
                             info!("Command executed: {}", cmd.unwrap_or("No command provided"));
                             match (cmd, remote_addr) {
                                 (Some(cmd), Some(remote_addr)) => {
                                     // Execute the command on the remote server and
                                     // then assume a local socket is opened to which
                                     // we can connect to on the remote_addr.
+                                    let mut channel = session.channel_session().await?; // dies here
+                                    info!("SSH channel established ");
                                     channel.exec(cmd).await?;
                                     let exit_code = channel.exit_status().expect("Failed to get exit code");
                                     if exit_code != 0 {
                                         error!("Command execution failed with exit code: {}", exit_code);
                                     }
-                                    let remote_socket_addr = remote_addr
-                                        .to_socket_addrs()?
-                                        .next()
-                                        .ok_or("Failed to resolve remote address")?;
-                                    let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+                                    let mut channel = session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await?;
                                     info!("Connected to remote address: {}", remote_addr);
                                     tokio::spawn(async move {
                                         if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
@@ -420,6 +459,8 @@ async fn run_server(
                                     // then assume since no remote_addr is provided
                                     // that communication is done over via stdio over
                                     // the channel.
+                                    let mut channel = session.channel_session().await?; // dies here
+                                    info!("SSH channel established ");
                                     channel.exec(cmd).await?;
                                     let exit_code = channel.exit_status().expect("Failed to get exit code");
                                     if exit_code != 0 {
@@ -436,11 +477,8 @@ async fn run_server(
                                     // It is assumed that after the jumping through the
                                     // jump list one is on a host from which the service
                                     // is reachable and already running.
-                                    let remote_socket_addr = remote_addr
-                                        .to_socket_addrs()?
-                                        .next()
-                                        .ok_or("Failed to resolve remote address")?;
-                                    let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
+                                    let mut channel = session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await?;
+                                    info!("SSH channel established ");
                                     info!("Connected to remote address: {}", remote_addr);
                                     tokio::spawn(async move {
                                         if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
@@ -576,6 +614,23 @@ pub fn bind(
         return;
     }
 
+    let jump_hosts: Vec<HostPort> = jump_hosts
+        .iter()
+        .map(|host| HostPort::try_from(host.as_str()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| {
+            error!("Failed to parse jump hosts: {}", e);
+            panic!("Invalid jump host, doesn't conform to URI format of RFC 3986 / RFC 7230 / RFC 9110");
+        });
+
+    let remote_addr = remote_addr
+        .map(|addr| HostPort::try_from(addr.as_str()))
+        .transpose()
+        .unwrap_or_else(|e| {
+            error!("Failed to parse remote address: {}", e);
+            panic!("Invalid remote address, doesn't conform to URI format of RFC 3986 / RFC 7230 / RFC 9110");
+        });
+
     let creds: YamlCreds = match serde_yml::from_str(&String::from_utf8_lossy(&output.stdout)) {
         Ok(creds) => creds,
         Err(e) => {
@@ -597,7 +652,7 @@ pub fn bind(
             if let Err(e) = run_server(
                 &bind_addr,
                 jump_hosts,
-                remote_addr.as_deref(),
+                remote_addr,
                 cmd.as_deref(),
                 creds,
                 token_clone,
