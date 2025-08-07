@@ -219,51 +219,16 @@ async fn userauth(
     while !ordered_auth.methods.is_empty() && !session.authenticated() {
         // Remove the first (preferred) method.
         let method = ordered_auth.methods.remove(0);
-        match method {
-            AuthMethod::Password => {
-                let result = session.userauth_password(&username, &password).await;
-                match result {
-                    Ok(_) if session.authenticated() => {
-                        info!("Authenticated via password.");
-                        break;
-                    }
-                    Ok(_) => {
-                        info!("Password authentication succeeded partially.");
-                        // Reparse to get the updated list of allowed methods.
-                        let new_auth_methods = session.auth_methods(&username).await?;
-                        ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
-                        info!("Updated authentication methods: {:?}", ordered_auth);
-                    }
-                    Err(e) => match totp_key {
-                        // this seems hacky but currently the only way to handle partial auth
-                        Some(_) => {
-                            info!("Probably partial auth: {:?}", e);
-                            ordered_auth =
-                                OrderedAuthMethods::parse(session.auth_methods(&username).await?);
-                            ordered_auth.methods.retain(|m| *m != AuthMethod::Password);
-                            ordered_auth.methods.retain(|m| *m != AuthMethod::PublicKey);
-                            info!(
-                                "Available authentication methods in order: {:?}",
-                                ordered_auth
-                            );
-                        }
-                        None => {
-                            error!("Password authentication failed: {:?}", e);
-                        }
-                    },
-                }
-            }
+        info!("Trying authentication method: {}", method);
+        let result = match method {
+            AuthMethod::Password => session.userauth_password(&username, &password).await,
             AuthMethod::KeyboardInteractive => {
                 let mut prompter = TotpPromptHandler {
                     creds: creds.clone(),
                 };
                 session
                     .userauth_keyboard_interactive(&username, &mut prompter)
-                    .await?;
-                if session.authenticated() {
-                    info!("Authenticated via keyboard-interactive.");
-                    break;
-                }
+                    .await
             }
             AuthMethod::PublicKey => {
                 info!("Attempting public key authentication via ssh config.");
@@ -311,22 +276,47 @@ async fn userauth(
                             identity_file,
                             None, // Optionally supply a passphrase here
                         )
-                        .await?;
-                    if session.authenticated() {
-                        info!("Authenticated via public key.");
-                        break;
-                    } else {
-                        warn!("Public key authentication failed.");
-                        let new_auth_methods = session.auth_methods(&username).await?;
-                        ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
-                    }
+                        .await
                 } else {
                     warn!("No IdentityFile found in SSH config for host {}", host);
+                    continue;
                 }
             }
             _ => {
                 info!("Skipping unsupported method: {}", method);
+                continue;
             }
+        };
+
+        match result {
+            Ok(_) if session.authenticated() => {
+                info!("Authenticated via {}.", method);
+                break;
+            }
+            Ok(_) => {
+                info!("{} authentication succeeded partially.", method);
+                // Reparse to get the updated list of allowed methods.
+                let new_auth_methods = session.auth_methods(&username).await?;
+                ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
+                info!("Updated authentication methods: {:?}", ordered_auth);
+            }
+            Err(e) => match totp_key {
+                // this seems hacky but currently the only way to handle partial auth
+                Some(_) => {
+                    info!("Probably partial auth: {:?}", e);
+                    ordered_auth =
+                        OrderedAuthMethods::parse(session.auth_methods(&username).await?);
+                    ordered_auth.methods.retain(|m| *m != method);
+                    ordered_auth.methods.retain(|m| *m != AuthMethod::PublicKey);
+                    info!(
+                        "Available authentication methods in order: {:?}",
+                        ordered_auth
+                    );
+                }
+                None => {
+                    error!("Password authentication failed: {:?}", e);
+                }
+            },
         }
     }
 
