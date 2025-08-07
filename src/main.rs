@@ -296,6 +296,7 @@ fn spawn_daemon_if_needed() {
     match server_ready.try_wait() {
         Ok(_) => {
             check_lock.post();
+            sending_stick.post();
             return;
         }
         Err(SemError::WouldBlock) => {
