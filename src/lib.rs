@@ -270,14 +270,30 @@ async fn userauth(
 
                 let host_params = {
                     // Read and parse the SSH configuration from ~/.ssh/config.
-                    let home = dirs::home_dir().ok_or("No home directory found")?;
+                    let home = dirs::home_dir().expect("No home directory found");
                     let config_path = home.join(".ssh/config");
+                    // open file if exists else continue
+                    let config_path = if config_path.exists() {
+                        config_path
+                    } else {
+                        info!("SSH config file not found at {:?}. Trying other Authentication Methods", config_path);
+                        continue;
+                    };
                     let file = File::open(&config_path)
                         .map_err(|e| format!("Failed to open SSH config: {}", e))?;
                     let mut reader = BufReader::new(file);
-                    let config = SshConfig::default()
-                        .parse(&mut reader, ParseRule::STRICT)
-                        .map_err(|e| format!("Failed to parse SSH config: {:?}", e))?;
+                    // Parse the SSH config file. if fails continue
+                    let config = SshConfig::default().parse(&mut reader, ParseRule::STRICT);
+
+                    let config = if config.is_ok() {
+                        config.unwrap()
+                    } else {
+                        info!(
+                            "Failed to parse SSH config: {:?}. Trying other Authentication Methods",
+                            config_path
+                        );
+                        continue;
+                    };
 
                     // Query the config for this host.
                     config.query(&host.host)
