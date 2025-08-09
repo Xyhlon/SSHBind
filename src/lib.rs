@@ -108,18 +108,18 @@ impl KeyboardInteractivePrompt for TotpPromptHandler {
                     || s.contains("code")
                     || s.contains("token")) =>
                 {
-                    code
+                    code.clone()
                 }
                 s if s.contains("pass") => self.creds.password.clone(),
                 _ => "".into(),
             };
             let response_type = match response {
-                s if s == self.creds.username => "Username",
-                s if s == code => "TOTP Code",
-                s if s == self.creds.password => "Password",
+                ref s if *s == self.creds.username => "Username",
+                ref s if *s == code => "TOTP Code",
+                ref s if *s == self.creds.password => "Password",
                 _ => "Nothing",
             };
-            info!("Prompt: {} | Response: {}", prompt.text, response_type);
+            info!("Prompt: {} | Responsed with {}", prompt.text, response_type);
             responses.push(response);
         }
         responses
