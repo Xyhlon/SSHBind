@@ -17,6 +17,7 @@ use ssh2_config::{ParseRule, SshConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
+use std::time::Duration;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -466,20 +467,42 @@ async fn run_server(
                                     if exit_code != 0 {
                                         error!("Command execution failed with exit code: {}", exit_code);
                                     }
-                                    let mut channel = session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await?;
-                                    info!("Connected to remote address: {}", remote_addr);
-                                    tokio::spawn(async move {
-                                        if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                            error!("Connection error: {e}");
+                                    // Wait for started service to be ready
+                                    // I know this isn't the cleanest solution
+                                    // open for suggestions
+                                    let mut counter = 0;
+                                    loop {
+                                        match session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await {
+                                            Ok(mut channel) => {
+                                                info!("SSH channel established ");
+                                                info!("Connected to remote address: {}", remote_addr);
+                                                tokio::spawn(async move {
+                                                    if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
+                                                        error!("Connection error: {e}");
+                                                    }
+                                                });
+                                                break;
+                                            }
+                                            Err(err) => {
+                                                if counter >= 10 {
+                                                    error!("Failed to connect to remote address {} after 10 attempts: {err}", remote_addr);
+                                                    return Err(err.into());
+                                                }
+                                                counter += 1;
+
+                                                // If the connect failed, wait a bit and retry
+                                                error!("remote not ready yet: {err}, retrying…");
+                                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                            }
                                         }
-                                    });
+                                    }
                                 }
                                 (Some(cmd), None) => {
                                     // Execute the command on the remote server and
                                     // then assume since no remote_addr is provided
                                     // that communication is done over via stdio over
                                     // the channel.
-                                    let mut channel = session.channel_session().await?; // dies here
+                                    let mut channel = session.channel_session().await?;
                                     info!("SSH channel established ");
                                     channel.exec(cmd).await?;
                                     let exit_code = channel.exit_status().expect("Failed to get exit code");
