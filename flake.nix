@@ -117,6 +117,8 @@
       checks = {
         # Build the crate as part of `nix flake check` for convenience
         inherit sshbind;
+        inherit (integrationTests) simple;
+        inherit (integrationTests) cli;
 
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
@@ -138,7 +140,6 @@
           };
           configPath = ".pre-commit-config-nix.yaml";
         };
-        inherit (integrationTests) simple;
 
         # Run clippy (and deny all warnings) on the crate source,
         # again, reusing the dependency artifacts from above.
@@ -181,14 +182,14 @@
         # Run tests with cargo-nextest
         # Consider setting `doCheck = false` on `my-crate` if you do not want
         # the tests to run twice
-        sshbind-nextest = craneLib.cargoNextest (commonArgs
-          // {
-            inherit cargoArtifacts;
-            partitions = 1;
-            partitionType = "count";
-            withLlvmCov = true;
-            # sandbox-paths = /tmp;
-          });
+        # sshbind-nextest = craneLib.cargoNextest (commonArgs
+        #   // {
+        #     inherit cargoArtifacts;
+        #     partitions = 1;
+        #     partitionType = "count";
+        #     withLlvmCov = true;
+        #     # sandbox-paths = /tmp;
+        #   });
       };
 
       packages =

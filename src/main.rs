@@ -4,10 +4,9 @@ use interprocess::local_socket::prelude::*;
 use interprocess::local_socket::{
     GenericFilePath, GenericNamespaced, ListenerOptions, Name, Stream, ToFsName, ToNsName,
 };
-use log::{error, info, LevelFilter};
+use log::{error, LevelFilter};
 use named_sem::{Error as SemError, NamedSemaphore};
 use serde::{Deserialize, Serialize};
-use serde_json;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::OpenOptions;
@@ -121,10 +120,8 @@ fn server_name() -> Result<Name<'static>, Box<dyn Error>> {
     } else {
         // Fallback for macOS/BSD to a filesystem path
         match SERVER_NAME_PATH.to_fs_name::<GenericFilePath>() {
-            Ok(n) => return Ok(n.into_owned()),
-            Err(e) => {
-                return Err(e.into());
-            }
+            Ok(n) => Ok(n.into_owned()),
+            Err(e) => Err(Box::new(e)),
         }
     }
 }
@@ -167,7 +164,7 @@ fn start_ipc_daemon() -> Result<(), Box<dyn Error>> {
 
     // Catch dispatch race condition. If the semaphore was already posted, another
     // daemon instance has already bound the socket and is running, so we exit.
-    if let Ok(_) = server_ready.try_wait() {
+    if server_ready.try_wait().is_ok() {
         check_lock.post().expect("Failed to post check_lock");
         return Ok(());
     }
@@ -178,7 +175,7 @@ fn start_ipc_daemon() -> Result<(), Box<dyn Error>> {
         Err(e) => {
             // Failed to convert the path into a Name, post the lock and propagate error.
             check_lock.post().expect("Failed to post check_lock");
-            return Err(e.into());
+            return Err(e);
         }
     };
     let listener = ListenerOptions::new()
@@ -201,6 +198,7 @@ fn start_ipc_daemon() -> Result<(), Box<dyn Error>> {
     let log_file = OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(true)
         .append(false)
         .open(LOG_PATH.as_path())
         .expect("Cannot open log file");
@@ -220,7 +218,7 @@ fn start_ipc_daemon() -> Result<(), Box<dyn Error>> {
                         // Log or ignore errors on individual client connections.
                         error!("Error handling client: {}", e);
                     }
-                    if TIME_TO_DIE.lock().unwrap().clone() {
+                    if *TIME_TO_DIE.lock().unwrap() {
                         cleanup_server_resources();
                         std::process::exit(0);
                     }
@@ -393,6 +391,7 @@ fn spawn_daemon_if_needed() {
             let stderr = OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(true)
                 .open(
                     LOG_PATH
                         .parent()
@@ -403,6 +402,7 @@ fn spawn_daemon_if_needed() {
             let stdout = OpenOptions::new()
                 .create(true)
                 .write(true)
+                .truncate(true)
                 .open(
                     LOG_PATH
                         .parent()
@@ -418,7 +418,7 @@ fn spawn_daemon_if_needed() {
                 .stderr(Stdio::from(stderr))
                 .spawn();
         }
-        Err(e) => (),
+        Err(_) => println!("Try again. Maybe reboot"),
     }
     check_lock.post().expect("Failed to post check_lock");
     flood_gate.wait().expect("Failed to wait for flood_gate");
@@ -446,8 +446,7 @@ fn main() {
             .append(true)
             .open(LOG_PATH.as_path())
             .expect("Cannot open log file");
-        let off = log_file.seek(start).expect("Cannot seek in log file");
-        off
+        log_file.seek(start).expect("Cannot seek in log file")
     } else {
         0
     };

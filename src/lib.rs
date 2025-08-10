@@ -251,14 +251,15 @@ async fn userauth(
                     // Parse the SSH config file. if fails continue
                     let config = SshConfig::default().parse(&mut reader, ParseRule::STRICT);
 
-                    let config = if config.is_ok() {
-                        config.unwrap()
-                    } else {
-                        info!(
+                    let config = match config {
+                        Ok(config) => config,
+                        Err(_) => {
+                            info!(
                             "Failed to parse SSH config: {:?}. Trying other Authentication Methods",
                             config_path
                         );
-                        continue;
+                            continue;
+                        }
                     };
 
                     // Query the config for this host.
