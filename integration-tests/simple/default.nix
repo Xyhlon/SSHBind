@@ -130,6 +130,10 @@
                   ip = "0.0.0.0";
                   port = 80;
                 }
+                {
+                  ip = "127.0.0.1";
+                  port = 8000;
+                }
               ];
               documentRoot = "/etc/var/www";
               extraConfig = ''
@@ -143,11 +147,7 @@
       };
       environment.etc = {
         "var/www/index.html".text = ''
-          <!DOCTYPE html>
-          <html>
-          <head><title>My Site</title></head>
-          <body><h1>Hello from NixOS!</h1></body>
-          </html>
+          Hello from NixOS!
         '';
       };
       virtualisation.vlans = [12];
@@ -218,7 +218,7 @@
     baseNodes;
 in
   pkgs.nixosTest {
-    name = "Simple ping test";
+    name = "Gateway Machine Target Testing Env";
     inherit nodes;
 
     testScript = ''
@@ -297,22 +297,23 @@ in
       totp.succeed("chown charlie:users -R /home/charlie/")
 
       user.send_chars("alice\n")
-      # user.wait_until_tty_matches("tty1", ".+assword(.+)?", 2)
       user.sleep(1)
       user.send_chars("alice\n")
-      user.send_chars("RUST_BACKTRACE=1 sshbind bind -a 127.0.0.1:8000 -r 192.168.12.2:80 -s ~/secrets.yaml -j 192.168.10.1:22 -j 192.168.11.3:22\n curl 127.0.0.1:8000\n")
-      user.send_chars("sshbind bind -a 127.0.0.1:8003 -r host-target:80 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22\n curl 127.0.0.1:8003\n")
+      # user.send_chars("RUST_BACKTRACE=1 sshbind bind -a 127.0.0.1:8000 -r 192.168.12.2:80 -s ~/secrets.yaml -j 192.168.10.1:22 -j 192.168.11.3:22\n curl 127.0.0.1:8000\n")
+      # user.send_chars("sshbind bind -a 127.0.0.1:8003 -r host-target:80 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22\n curl 127.0.0.1:8003\n")
       # user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8003 -r host-target:80 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22'")
       # user.execute("su -l alice -c 'sshbind bind -a 127.0.0.1:8001 -r 192.168.12.2:80 -s ~/secrets.yaml -j 192.168.10.1:22 -j 192.168.11.3:22'", timeout=5)
 
       # Testing basic usage
-      # user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8000 -r 192.168.12.2:80 -s ~/secrets.yaml -j 192.168.10.1:22 -j 192.168.11.3:22'")
-      # user.send_chars("sshbind bind -a 127.0.0.1:8000 -r 192.168.12.2:80 -s ~/secrets.yaml -j 192.168.10.1:22 -j 192.168.11.3:22\n curl 127.0.0.1:8000")
-      # user.execute("su -l alice -c 'sshbind bind -a 127.0.0.1:8000 -r 192.168.12.2:80 -s ~/secrets.yaml -j 192.168.10.1:22 -j 192.168.11.3:22'", timeout=5)
-      # user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8000 -r host-target:80 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22'")
-      # user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8000 -r target:80 -s ~/secrets.yaml -j passwd:22 -j totp:22'")
-      # user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8001 -r host-target:12345 -s ~/secrets.yaml -j host-passwd:22 -j totp:22 -j host-target:22 -c "socat TCP-LISTEN:12345,fork EXEC:cat"'""")
-      # user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8002 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "cat"'""")
-      # print(user.succeed("""su -l alice -c 'sshbind list'"""))
+      user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8000 -r 192.168.12.2:80 -s ~/secrets.yaml -j 192.168.10.1:22 -j 192.168.11.3:22'")
+      assert user.succeed("su -l alice -c 'curl 127.0.0.1:8000'") == "Hello from NixOS!\n", "Failed ip chain connection with remote service"
+      user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8001 -r host-target:80 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22'")
+      assert user.succeed("su -l alice -c 'curl 127.0.0.1:8001'") == "Hello from NixOS!\n", "Failed hostname chain connection with remote service"
+      user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8002 -r 127.0.0.1:12345 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "socat TCP-LISTEN:12345,fork EXEC:cat"'""")
+      assert user.succeed(r"""su -l alice -c "printf 'Hello Nixos!\n' | nc -N -w 3 127.0.0.1 8002" """) == "Hello Nixos!\n", "Failed hostname chain connection with remote service and command"
+      user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8003 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "echo \"Hi\""'""")
+      assert user.succeed(r"""su -l alice -c "nc -N 127.0.0.1 8003 </dev/null" """) == "Hi\n", "Failed hostname chain connection with remote service and command using internal pipe"
+      user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8004 -r 127.0.0.1:8000 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22'")
+      assert user.succeed("su -l alice -c 'curl 127.0.0.1:8004'") == "Hello from NixOS!\n", "Failed hostname chain connection with local service"
     '';
   }
