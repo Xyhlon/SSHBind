@@ -2,3 +2,7 @@
 result*
 .direnv/
 .pre-commit-config-nix.yaml
+.google_authenticator
+.nixos-test-history
+.sops.yaml
+secrets.yaml
