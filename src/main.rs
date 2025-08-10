@@ -1,15 +1,19 @@
 use clap::{Parser, Subcommand};
 use env_logger::{Builder, Target};
-use log::{info, LevelFilter};
+use interprocess::local_socket::prelude::*;
+use interprocess::local_socket::{
+    GenericFilePath, GenericNamespaced, ListenerOptions, Name, Stream, ToFsName, ToNsName,
+};
+use log::{error, info, LevelFilter};
 use named_sem::{Error as SemError, NamedSemaphore};
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::collections::HashMap;
 use std::error::Error;
-use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Seek;
 use std::io::SeekFrom;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::result::Result;
@@ -17,8 +21,6 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use ipc_channel::ipc::{channel, IpcOneShotServer, IpcReceiver, IpcSender};
 
 static LOG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     dirs::data_local_dir()
@@ -28,6 +30,8 @@ static LOG_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
 
 static BINDINGS: LazyLock<Mutex<HashMap<String, BindingDetails>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static TIME_TO_DIE: LazyLock<Mutex<bool>> = LazyLock::new(|| Mutex::new(false));
 
 #[derive(Serialize, Deserialize, Debug)]
 enum DaemonCommand {
@@ -57,6 +61,7 @@ enum DaemonResponse {
 struct BindingDetails {
     addr: String,
     jump_hosts: Vec<String>,
+    cmd: Option<String>,
     remote: Option<String>,
     timestamp: u64,
 }
@@ -98,6 +103,7 @@ enum Commands {
     Daemon,
 }
 
+// Path where we will both listen and also advertise our socket name to clients.
 const SERVER_NAME_PATH: &str = "/tmp/sshbind_daemon.ipc";
 const SEM_SERVER_READY: &str = "/sshbind_server_ready";
 // Serializes client creation and server readiness checking
@@ -108,45 +114,88 @@ const SEM_SENDING_STICK: &str = "/sshbind_sending_stick";
 const SEM_CHECK_LOCK: &str = "/sshbind_check_lock";
 const SEM_FLOOD_GATE: &str = "/sshbind_flood_gate";
 
-/// Starts the one-shot IPC server that loops to handle clients.
+fn server_name() -> Result<Name<'static>, Box<dyn Error>> {
+    // Prefer non-persistent, namespaced name
+    if let Ok(n) = "sshbind.daemon".to_ns_name::<GenericNamespaced>() {
+        Ok(n.into_owned())
+    } else {
+        // Fallback for macOS/BSD to a filesystem path
+        match SERVER_NAME_PATH.to_fs_name::<GenericFilePath>() {
+            Ok(n) => return Ok(n.into_owned()),
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+    }
+}
+
+fn cleanup_server_resources() {
+    let mut sending_stick = NamedSemaphore::create(SEM_SENDING_STICK, 1)
+        .expect("Failed to create sending_stick semaphore");
+    let mut server_ready = NamedSemaphore::create(SEM_SERVER_READY, 0)
+        .expect("Failed to create server_ready semaphore");
+    let mut check_lock =
+        NamedSemaphore::create(SEM_CHECK_LOCK, 1).expect("Failed to create check_lock semaphore");
+    let mut flood_gate =
+        NamedSemaphore::create(SEM_FLOOD_GATE, 0).expect("Failed to create flood_gate semaphore");
+    sending_stick
+        .wait()
+        .expect("Failed to wait for sending_stick");
+    check_lock.wait().expect("Failed to wait for check_lock");
+    server_ready
+        .wait()
+        .expect("Failed to wait for server_ready");
+
+    check_lock.post().expect("Failed to post check_lock");
+    flood_gate.wait().expect("Failed to wait for flood_gate");
+    sending_stick.post().expect("Failed to post sending_stick");
+}
+
 fn start_ipc_daemon() -> Result<(), Box<dyn Error>> {
     // Bootstrap first server
     let mut server_ready = NamedSemaphore::create(SEM_SERVER_READY, 0)
-        .expect("failed to create server_ready semaphore");
-
+        .expect("Failed to create server_ready semaphore");
     let mut check_lock =
-        NamedSemaphore::create(SEM_CHECK_LOCK, 1).expect("failed to create check_lock semaphore");
-
+        NamedSemaphore::create(SEM_CHECK_LOCK, 1).expect("Failed to create check_lock semaphore");
     let mut flood_gate =
-        NamedSemaphore::create(SEM_FLOOD_GATE, 0).expect("failed to create server_ready semaphore");
+        NamedSemaphore::create(SEM_FLOOD_GATE, 0).expect("Failed to create server_ready semaphore");
 
+    // Serialize client creation and server readiness checking
     check_lock
         .wait()
         .expect("Failed to wait for startup semaphore");
-    // Catch dispatch race condition
-    // could be better solved via extra semaphore which the clients provide
-    // and the server instances waits for and the first getting it is the
-    // real server.
-    // I should definitly fix this as there is a race-condition
-    // with the waiting procedure induced by the client
-    let (mut server, mut server_name) = match server_ready.try_wait() {
-        Ok(_) => return Ok(()), // Server,
-        Err(SemError::WouldBlock) => {
-            let (mut server, mut server_name) =
-                IpcOneShotServer::<(DaemonCommand, IpcSender<DaemonResponse>)>::new()
-                    .expect("failed to create one-shot server");
-            std::fs::write(SERVER_NAME_PATH, &server_name)?;
 
-            info!("Wrote server name to {}", SERVER_NAME_PATH);
-            server_ready.post();
-            (server, server_name)
+    // Catch dispatch race condition. If the semaphore was already posted, another
+    // daemon instance has already bound the socket and is running, so we exit.
+    if let Ok(_) = server_ready.try_wait() {
+        check_lock.post().expect("Failed to post check_lock");
+        return Ok(());
+    }
+
+    // We are the first server. Bind a local socket on the predetermined path.
+    let socket_name = match server_name() {
+        Ok(name) => name,
+        Err(e) => {
+            // Failed to convert the path into a Name, post the lock and propagate error.
+            check_lock.post().expect("Failed to post check_lock");
+            return Err(e.into());
         }
-        Err(e) => return Err(Box::new(e)),
     };
-    check_lock.post();
+    let listener = ListenerOptions::new()
+        .name(socket_name)
+        .create_sync()
+        .map_err(|e| {
+            // Failed to bind the socket; post the lock and propagate error.
+            check_lock.post().expect("Failed to post check_lock");
+            Box::<dyn Error>::from(e)
+        })?;
 
-    flood_gate.post();
+    // Signal readiness so clients can continue.
+    server_ready.post().expect("Failed to post server_ready");
+    check_lock.post().expect("Failed to post check_lock");
+    flood_gate.post().expect("Failed to post flood_gate");
 
+    // Initialise logging to our log file
     std::fs::create_dir_all(LOG_PATH.parent().expect("Parent must exist"))
         .expect("Failed to create log directory");
     let log_file = OpenOptions::new()
@@ -155,55 +204,113 @@ fn start_ipc_daemon() -> Result<(), Box<dyn Error>> {
         .append(false)
         .open(LOG_PATH.as_path())
         .expect("Cannot open log file");
-
     Builder::new()
         .filter(None, LevelFilter::Debug)
         .target(Target::Pipe(Box::new(log_file)))
         .init();
 
-    loop {
-        // Accept a single client: returns (receiver,_msg)
-        let (rx, (cmd, resp_tx)): (
-            IpcReceiver<(DaemonCommand, IpcSender<DaemonResponse>)>,
-            (DaemonCommand, IpcSender<DaemonResponse>),
-        ) = server.accept()?;
-
-        // Spawn handler thread
-        thread::spawn(move || {
-            let response = handle_command(cmd);
-            let _ = resp_tx.send(response);
-        });
-        // Prepare next one-shot server
-        let (new_server, new_server_name) =
-            IpcOneShotServer::<(DaemonCommand, IpcSender<DaemonResponse>)>::new()
-                .expect("failed to create one-shot server");
-        server = new_server;
-        server_name = new_server_name;
-        std::fs::write(SERVER_NAME_PATH, &server_name)?;
+    // Accept incoming connections. Each stream is handled in its own thread.
+    for stream in listener.incoming() {
+        match stream {
+            Ok(mut stream) => {
+                thread::spawn(move || {
+                    // Read a single command from the stream, handle it, and write
+                    // back the response. Newlines delimit messages.
+                    if let Err(e) = handle_client_stream(&mut stream) {
+                        // Log or ignore errors on individual client connections.
+                        error!("Error handling client: {}", e);
+                    }
+                    if TIME_TO_DIE.lock().unwrap().clone() {
+                        cleanup_server_resources();
+                        std::process::exit(0);
+                    }
+                });
+            }
+            Err(e) => {
+                // If accepting a connection fails, log and continue listening.
+                error!("Failed to accept client: {}", e);
+            }
+        }
     }
+    Ok(())
+}
+
+/// Handle a single client connection on the server side.
+///
+/// The protocol is newline-delimited JSON.  We read bytes until a newline
+/// character, deserialize the command, invoke the handler, then write the
+/// serialized response followed by a newline.  Using JSON via serde allows
+/// forward compatibility and human readability.
+fn handle_client_stream(stream: &mut Stream) -> Result<(), Box<dyn Error>> {
+    // Read the incoming command up to the newline delimiter
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream.read(&mut byte)?;
+        if n == 0 {
+            // Connection closed prematurely
+            return Err(Box::from("client closed connection"));
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        buf.push(byte[0]);
+    }
+
+    // Deserialize command using serde_json
+    let cmd: DaemonCommand = serde_json::from_slice(&buf)?;
+    let response = handle_command(cmd);
+    // Serialize the response and write it back with a newline terminator
+    let resp_bytes = serde_json::to_vec(&response)?;
+    stream.write_all(&resp_bytes)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    Ok(())
 }
 
 /// Client-side: send a command and wait for a response.
 fn send_command(cmd: DaemonCommand) -> Result<DaemonResponse, String> {
-    let server_name = std::fs::read_to_string(SERVER_NAME_PATH)
-        .map_err(|e| format!("Failed to read server name: {}", e))?;
-    // Connect to server one-shot name
-    let tx: IpcSender<(DaemonCommand, IpcSender<DaemonResponse>)> =
-        IpcSender::connect(server_name).expect("ipc connect failed");
-
-    // Create reply channel
-    let (resp_tx, resp_rx): (IpcSender<DaemonResponse>, IpcReceiver<DaemonResponse>) =
-        channel().map_err(|e| format!("IPC channel error: {}", e))?;
-    // Send (command, reply-sender)
-    tx.send((cmd, resp_tx))
+    let socket_name = match server_name() {
+        Ok(name) => name,
+        Err(e) => {
+            return Err(format!("Failed to get server name: {}", e));
+        }
+    };
+    let mut stream =
+        Stream::connect(socket_name).map_err(|e| format!("ipc connect failed: {}", e))?;
+    // Serialize and send the command with a newline terminator
+    let cmd_bytes = serde_json::to_vec(&cmd).map_err(|e| format!("serialize error: {}", e))?;
+    stream
+        .write_all(&cmd_bytes)
         .map_err(|e| format!("IPC send error: {}", e))?;
-    // Wait for response
-    resp_rx.recv().map_err(|e| format!("IPC recv error: {}", e))
+    stream
+        .write_all(b"\n")
+        .map_err(|e| format!("IPC send error: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("IPC flush error: {}", e))?;
+    // Read the response up to the newline delimiter
+    let mut buf = Vec::new();
+    loop {
+        let mut byte = [0u8; 1];
+        let n = stream
+            .read(&mut byte)
+            .map_err(|e| format!("IPC recv error: {}", e))?;
+        if n == 0 {
+            return Err("IPC recv error: server closed connection".into());
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        buf.push(byte[0]);
+    }
+    let resp: DaemonResponse =
+        serde_json::from_slice(&buf).map_err(|e| format!("deserialize error: {}", e))?;
+    Ok(resp)
 }
 
 /// Process a DaemonCommand and mutate state, returning a DaemonResponse.
 fn handle_command(cmd: DaemonCommand) -> DaemonResponse {
-    let mut time_to_die = false;
     let response = match cmd {
         DaemonCommand::Ping => DaemonResponse::Success("PONG".into()),
         DaemonCommand::Bind {
@@ -222,6 +329,7 @@ fn handle_command(cmd: DaemonCommand) -> DaemonResponse {
                     BindingDetails {
                         addr: addr.clone(),
                         jump_hosts: jump_hosts.clone(),
+                        cmd: cmd.clone(),
                         remote: remote.clone(),
                         timestamp: SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -244,7 +352,8 @@ fn handle_command(cmd: DaemonCommand) -> DaemonResponse {
                 sshbind::unbind(&a);
             }
             binds.clear();
-            time_to_die = true;
+            let mut ttd = TIME_TO_DIE.lock().unwrap();
+            *ttd = true;
             DaemonResponse::Success("All bindings cleared. Shutting down.".into())
         }
         DaemonCommand::List => {
@@ -252,41 +361,18 @@ fn handle_command(cmd: DaemonCommand) -> DaemonResponse {
             DaemonResponse::List(list)
         }
     };
-    if time_to_die {
-        let mut sending_stick = NamedSemaphore::create(SEM_SENDING_STICK, 1)
-            .expect("failed to create sending_stick semaphore");
-        let mut server_ready = NamedSemaphore::create(SEM_SERVER_READY, 0)
-            .expect("failed to create server_ready semaphore");
-        let mut check_lock = NamedSemaphore::create(SEM_CHECK_LOCK, 1)
-            .expect("failed to create check_lock semaphore");
-        let mut flood_gate = NamedSemaphore::create(SEM_FLOOD_GATE, 0)
-            .expect("failed to create flood_gate semaphore");
-        sending_stick
-            .wait()
-            .expect("Failed to wait for sending_stick");
-        check_lock.wait().expect("Failed to wait for check_lock");
-        server_ready
-            .wait()
-            .expect("Failed to wait for server_ready");
-        check_lock.post();
-        flood_gate.wait().expect("Failed to wait for flood_gate");
-        sending_stick.post();
-
-        std::process::exit(0);
-    }
     response
 }
 
 fn spawn_daemon_if_needed() {
-    println!("Checking if daemon is running...");
     let mut server_ready = NamedSemaphore::create(SEM_SERVER_READY, 0)
-        .expect("failed to create server_ready semaphore");
+        .expect("Failed to create server_ready semaphore");
     let mut check_lock =
-        NamedSemaphore::create(SEM_CHECK_LOCK, 1).expect("failed to create server_ready semaphore");
+        NamedSemaphore::create(SEM_CHECK_LOCK, 1).expect("Failed to create server_ready semaphore");
     let mut flood_gate =
-        NamedSemaphore::create(SEM_FLOOD_GATE, 0).expect("failed to create flood_gate semaphore");
+        NamedSemaphore::create(SEM_FLOOD_GATE, 0).expect("Failed to create flood_gate semaphore");
     let mut sending_stick = NamedSemaphore::create(SEM_SENDING_STICK, 1)
-        .expect("failed to create sending_stick semaphore");
+        .expect("Failed to create sending_stick semaphore");
     sending_stick
         .wait()
         .expect("Failed to wait for sending_stick");
@@ -295,15 +381,16 @@ fn spawn_daemon_if_needed() {
         .expect("Failed to wait for startup semaphore");
     match server_ready.try_wait() {
         Ok(_) => {
-            check_lock.post();
-            sending_stick.post();
+            server_ready.post().expect("Failed to post server_ready");
+            check_lock.post().expect("Failed to post check_lock");
+            sending_stick.post().expect("Failed to post sending_stick");
             return;
         }
         Err(SemError::WouldBlock) => {
             std::fs::create_dir_all(LOG_PATH.parent().expect("Parent must exist"))
                 .expect("Failed to create log directory");
 
-            let mut stderr = OpenOptions::new()
+            let stderr = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .open(
@@ -312,8 +399,8 @@ fn spawn_daemon_if_needed() {
                         .expect("Parent must exist")
                         .join("sshbind_stderr.log"),
                 )
-                .expect("Cannot open log file");
-            let mut stdout = OpenOptions::new()
+                .expect("Cannot open stderr log file");
+            let stdout = OpenOptions::new()
                 .create(true)
                 .write(true)
                 .open(
@@ -322,7 +409,7 @@ fn spawn_daemon_if_needed() {
                         .expect("Parent must exist")
                         .join("sshbind_stdout.log"),
                 )
-                .expect("Cannot open log file");
+                .expect("Cannot open stdout log file");
             let exe = std::env::current_exe().expect("Failed to get current exe");
 
             let _ = Command::new(exe)
@@ -330,19 +417,13 @@ fn spawn_daemon_if_needed() {
                 .stdout(Stdio::from(stdout))
                 .stderr(Stdio::from(stderr))
                 .spawn();
-            println!("Daemon started.");
         }
-        Err(e) => {
-            println!("Error waiting for server_ready: {}", e);
-            ()
-        }
+        Err(e) => (),
     }
-    check_lock.post();
-    println!("Waiting for daemon to start...");
+    check_lock.post().expect("Failed to post check_lock");
     flood_gate.wait().expect("Failed to wait for flood_gate");
-    flood_gate.post();
-    sending_stick.post();
-    println!("Daemon is running.");
+    flood_gate.post().expect("Failed to post flood_gate");
+    sending_stick.post().expect("Failed to post sending_stick");
 }
 
 fn main() {
@@ -434,6 +515,10 @@ fn main() {
                             b.timestamp,
                             b.jump_hosts
                         );
+                        match b.cmd {
+                            None => println!("  Command: None"),
+                            Some(ref cmd) => println!("  Command: {:?}", cmd),
+                        }
                     }
                 }
                 Ok(resp) => println!("Unexpected: {:?}", resp),
