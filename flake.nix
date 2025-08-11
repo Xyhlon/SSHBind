@@ -119,6 +119,7 @@
         inherit sshbind;
         inherit (integrationTests) simple;
         inherit (integrationTests) cli;
+        inherit (integrationTests) performance;
 
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
