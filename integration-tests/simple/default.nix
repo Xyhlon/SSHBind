@@ -27,9 +27,13 @@
           wget
           socat
           dig
-          wrk2
+          btop
         ];
       };
+      environment.systemPackages = with pkgs; [
+        wrk2
+        oha
+      ];
       networking = {
         hostName = "user"; # Define your hostname.
       };
@@ -317,5 +321,7 @@ in
       user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8004 -r 127.0.0.1:8000 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22'")
       assert user.succeed("su -l alice -c 'curl 127.0.0.1:8004'") == "Hello from NixOS!\n", "Failed hostname chain connection with local service"
       user.succeed(r"wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8000/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8001/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8002/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8003/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8004/")
+      user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8000")
+      # print(user.succeed("cat /home/alice/.local/share/sshbind/sshbind.log"))
     '';
   }

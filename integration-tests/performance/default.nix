@@ -26,6 +26,7 @@
         sockperf
         stress-ng
         wrk2
+        oha
       ];
     };
     target = {...}: {
