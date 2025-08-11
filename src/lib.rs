@@ -90,16 +90,10 @@ impl KeyboardInteractivePrompt for TotpPromptHandler {
         if !instructions.is_empty() {
             info!("Instructions: {}", instructions);
         }
-        let _ = self.creds.clone();
 
         let mut responses = Vec::with_capacity(prompts.len());
         for prompt in prompts {
             // Print the prompt text and flush to ensure it appears before input.
-            let code = TOTPBuilder::new()
-                .base32_key(&self.creds.totp_key.clone().unwrap_or("".to_string()))
-                .finalize()
-                .expect("Failed to build totp builder")
-                .generate();
             let response = match prompt.text.to_lowercase() {
                 s if s.contains("user") => self.creds.username.clone(),
                 s if (s.contains("otp")
@@ -109,16 +103,20 @@ impl KeyboardInteractivePrompt for TotpPromptHandler {
                     || s.contains("code")
                     || s.contains("token")) =>
                 {
-                    code.clone()
+                    TOTPBuilder::new()
+                        .base32_key(&self.creds.totp_key.clone().expect("TOTP key is required"))
+                        .finalize()
+                        .expect("Failed to build totp builder")
+                        .generate()
                 }
                 s if s.contains("pass") => self.creds.password.clone(),
                 _ => "".into(),
             };
             let response_type = match response {
                 ref s if *s == self.creds.username => "Username",
-                ref s if *s == code => "TOTP Code",
                 ref s if *s == self.creds.password => "Password",
-                _ => "Nothing",
+                ref s if s.is_empty() => "Nothing",
+                _ => "TOTP Code",
             };
             info!("Prompt: {} | Responsed with {}", prompt.text, response_type);
             responses.push(response);
