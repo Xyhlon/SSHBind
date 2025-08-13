@@ -18,8 +18,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
-use tokio::io::copy_bidirectional;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -333,6 +334,253 @@ async fn userauth(
     }
 }
 
+// Same as recommended way
+// fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+// where
+//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+// {
+//     tokio::spawn(async move {
+//         let mut buf_a = vec![0u8; 16 * 1024];
+//         let mut buf_b = vec![0u8; 16 * 1024];
+//
+//         loop {
+//             tokio::select! {
+//                 res = a.read(&mut buf_a) => {
+//                     match res {
+//                         Ok(0) => {
+//                             break;
+//                         }
+//                         Ok(n) => b.write_all(&buf_a[..n]).await?,
+//                         Err(e) => return Err(e),
+//                     }
+//                 }
+//                 res = b.read(&mut buf_b) => {
+//                     match res {
+//                         Ok(0) => {
+//                             break;
+//                         }
+//                         Ok(n) => a.write_all(&buf_b[..n]).await?,
+//                         Err(e) => return Err(e),
+//                     }
+//                 }
+//             }
+//         }
+//
+//         Ok(())
+//     })
+// }
+
+// Kinda works but dies under repeated hard sockperf througput testing
+// fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+// where
+//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+// {
+//     tokio::spawn(async move {
+//         let mut buf_a = vec![0u8; 16 * 1024];
+//         let mut buf_b = vec![0u8; 16 * 1024];
+//
+//         // Track whether each *direction* is still open:
+//         let mut a_to_b_open = true; // reading A, writing to B
+//         let mut b_to_a_open = true; // reading B, writing to A
+//
+//         // Handling this in that way is kinda sus, however afaik libssh2 channel
+//         // need to handle the shutdown of the write side manually.
+//         while a_to_b_open || b_to_a_open {
+//             tokio::select! {
+//                 // A -> B
+//                 res = a.read(&mut buf_a), if a_to_b_open => {
+//                     match res {
+//                         Ok(0) => {
+//                             // A sent EOF: stop writing to B
+//                             a_to_b_open = false;
+//                             let _ = b.shutdown().await; // half-close B's write side
+//                         }
+//                         Ok(n) => b.write_all(&buf_a[..n]).await?,
+//                         Err(e) => return Err(e),
+//                     }
+//                 }
+//
+//                 // B -> A
+//                 res = b.read(&mut buf_b), if b_to_a_open => {
+//                     match res {
+//                         Ok(0) => {
+//                             // B sent EOF: stop writing to A
+//                             b_to_a_open = false;
+//                             let _ = a.shutdown().await; // half-close A's write side
+//                         }
+//                         Ok(n) => a.write_all(&buf_b[..n]).await?,
+//                         Err(e) => return Err(e),
+//                     }
+//                 }
+//             }
+//         }
+//
+//         Ok(())
+//     })
+// }
+
+fn connect_duplex<A, B>(
+    mut a: A,
+    mut b: async_ssh2_lite::AsyncChannel<B>,
+) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+where
+    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buf_a = vec![0u8; 16 * 1024];
+        let mut buf_b = vec![0u8; 16 * 1024];
+
+        // Track whether each *direction* is still open:
+        let mut a_to_b_open = true; // reading A, writing to B
+        let mut b_to_a_open = true; // reading B, writing to A
+
+        // Handling this in that way is kinda sus, however afaik libssh2 channel
+        // need to handle the shutdown of the write side manually.
+        while a_to_b_open || b_to_a_open {
+            tokio::select! {
+                // A -> B
+                res = a.read(&mut buf_a), if a_to_b_open => {
+                    match res {
+                        Ok(0) => {
+                            // A sent EOF: stop writing to B
+                            a_to_b_open = false;
+                            let _ = b.send_eof().await;
+                            let _ = b.wait_eof().await;
+                            let _ = b.close().await;
+
+                        }
+                        Ok(n) => b.write_all(&buf_a[..n]).await?,
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                // B -> A
+                res = b.read(&mut buf_b), if b_to_a_open => {
+                    match res {
+                        Ok(0) => {
+                            // B sent EOF: stop writing to A
+                            b_to_a_open = false;
+                            let _ = a.shutdown().await; // half-close A's write side
+                        }
+                        Ok(n) => a.write_all(&buf_b[..n]).await?,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    })
+}
+
+// Doesn't really work but it is the recommended way for forwarding the stream
+// https://github.com/bk-rs/ssh-rs/blob/main/async-ssh2-lite/demos/smol/src/proxy_jump.rs
+// Dies with simple iperf3 test
+// fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+// where
+//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+// {
+//     tokio::spawn(async move {
+//         let mut buf_bastion_channel = vec![0; 16 * 2048];
+//         let mut buf_forward_stream_r = vec![0; 16 * 2048];
+//
+//         loop {
+//             tokio::select! {
+//                 ret_forward_stream_r = a.read(&mut buf_forward_stream_r) => match ret_forward_stream_r {
+//                     Ok(0) => {
+//                         break
+//                     },
+//                     Ok(n) => {
+//                         b.write(&buf_forward_stream_r[..n]).await.map(|_| ()).map_err(|err| {
+//                             eprintln!("bastion_channel write failed, err:{err:?}");
+//                             err
+//                         })?
+//                     },
+//                     Err(err) =>  {
+//                         eprintln!("forward_stream_r read failed, err:{err:?}");
+//
+//                         return Err(err);
+//                     }
+//                 },
+//                 ret_bastion_channel = b.read(&mut buf_bastion_channel) => match ret_bastion_channel {
+//                     Ok(0) => {
+//                         break
+//                     },
+//                     Ok(n) => {
+//                         a.write(&buf_bastion_channel[..n]).await.map(|_| ()).map_err(|err| {
+//                             eprintln!("forward_stream_r write failed, err:{err:?}");
+//                             err
+//                         })?
+//                     },
+//                     Err(err) => {
+//                         eprintln!("bastion_channel read failed, err:{err:?}");
+//
+//                         return Err(err);
+//                     }
+//                 },
+//             }
+//         }
+//
+//         Ok(())
+//     })
+// }
+
+// fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+// where
+//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+// {
+//     tokio::spawn(async move {
+//         // big-ish buffers are fine; throughput tools benefit
+//         let mut ab = vec![0u8; 1024];
+//         let mut ba = vec![0u8; 1024];
+//
+//         // track if each direction is still flowing
+//         let mut ab_open = true;
+//         let mut ba_open = true;
+//
+//         loop {
+//             if !ab_open && !ba_open {
+//                 break;
+//             }
+//
+//             tokio::select! {
+//                 // A -> B
+//                 res = a.read(&mut ab), if ab_open => {
+//                     match res {
+//                         Ok(0) => {
+//                             // DON'T call shutdown() here; just stop this direction.
+//                             ab_open = false;
+//                         }
+//                         Ok(n) => b.write_all(&ab[..n]).await?,
+//                         Err(e) => return Err(e),
+//                     }
+//                 }
+//
+//                 // B -> A
+//                 res = b.read(&mut ba), if ba_open => {
+//                     match res {
+//                         Ok(0) => {
+//                             // DON'T call shutdown() here either.
+//                             ba_open = false;
+//                         }
+//                         Ok(n) => a.write_all(&ba[..n]).await?,
+//                         Err(e) => return Err(e),
+//                     }
+//                 }
+//             }
+//         }
+//
+//         // Exiting the task drops both `a` and `b`. That closes cleanly
+//         // without breaking async-ssh2-lite's "read may need write" invariant.
+//         Ok(())
+//     })
+// }
+
 /// Establishes an SSH session chain through the given jump hosts.
 ///
 /// # Arguments
@@ -358,7 +606,7 @@ async fn connect_chain(
 
     for (i, jump) in jump_hosts.iter().enumerate().skip(1) {
         info!("Connecting through jump {}: {}", i, jump);
-        let mut channel = session
+        let channel = session
             .channel_direct_tcpip(&jump.host, jump.port, None)
             .await?;
 
@@ -368,12 +616,10 @@ async fn connect_chain(
         let accept_task =
             tokio::spawn(async move { listener.accept().await.map(|(local_conn, _)| local_conn) });
 
-        let client_conn = TcpStream::connect(local_addr).await?;
-        let mut server_conn = accept_task.await?.map_err(|e| e.to_string())?;
+        let client_conn = TokioTcpStream::connect(local_addr).await?;
+        let server_conn = accept_task.await?.map_err(|e| e.to_string())?;
 
-        tokio::spawn(async move {
-            let _ = copy_bidirectional(&mut channel, &mut server_conn).await;
-        });
+        connect_duplex(server_conn, channel);
 
         session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
         session.handshake().await?;
@@ -427,6 +673,8 @@ async fn run_server(
         cvar.notify_one();
     }
     let remote_addr = remote_addr.as_ref();
+    let session = connect_chain(&jump_hosts, &creds).await?;
+    info!("SSH session established");
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -435,24 +683,17 @@ async fn run_server(
             }
             result = listener.accept() => {
                 match result {
-                    Ok((mut inbound, _)) => {
-                        if jump_hosts.is_empty() {
+                    Ok((inbound, _)) if jump_hosts.is_empty() => {
                             let socket = remote_addr
                                 .expect("Remote address is required when no jump hosts are provided")
                                 .to_string()
                                 .to_socket_addrs()?
                                 .next()
                                 .expect("Failed to resolve remote address");
-                            let mut outbound = TcpStream::connect(socket).await?;
-                            tokio::spawn(async move {
-                                if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
-                                    error!("Connection error: {e}");
-                                }
-                            });
-                        }
-                        else{
-                            let session = connect_chain(&jump_hosts, &creds).await?;
-                            info!("SSH session established");
+                            let outbound = TokioTcpStream::connect(socket).await?;
+                            connect_duplex(inbound, outbound);
+                        },
+                   Ok((inbound, _))  => {
                             info!("Command executed: {}", cmd.unwrap_or("No command provided"));
                             match (cmd, remote_addr) {
                                 (Some(cmd), Some(remote_addr)) => {
@@ -462,24 +703,25 @@ async fn run_server(
                                     let mut channel = session.channel_session().await?; // dies here
                                     info!("SSH channel established ");
                                     channel.exec(cmd).await?;
-                                    let exit_code = channel.exit_status().expect("Failed to get exit code");
-                                    if exit_code != 0 {
-                                        error!("Command execution failed with exit code: {}", exit_code);
-                                    }
+
+                                    let _ = channel.send_eof().await;
+                                    let _ = channel.wait_eof().await;
+                                    let _ = channel.close().await;
+                                    let _ = channel.wait_close().await;
+                                    // let exit_code = channel.exit_status().expect("Failed to get exit code");
+                                    // if exit_code != 0 {
+                                    //     error!("Command execution failed with exit code: {}", exit_code);
+                                    // }
                                     // Wait for started service to be ready
                                     // I know this isn't the cleanest solution
                                     // open for suggestions
                                     let mut counter = 0;
                                     loop {
                                         match session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await {
-                                            Ok(mut channel) => {
+                                            Ok(channel) => {
                                                 info!("SSH channel established ");
                                                 info!("Connected to remote address: {}", remote_addr);
-                                                tokio::spawn(async move {
-                                                    if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                                        error!("Connection error: {e}");
-                                                    }
-                                                });
+                                                connect_duplex(inbound, channel);
                                                 break;
                                             }
                                             Err(err) => {
@@ -504,29 +746,21 @@ async fn run_server(
                                     let mut channel = session.channel_session().await?;
                                     info!("SSH channel established ");
                                     channel.exec(cmd).await?;
-                                    let exit_code = channel.exit_status().expect("Failed to get exit code");
-                                    if exit_code != 0 {
-                                        error!("Command execution failed with exit code: {}", exit_code);
-                                    }
-                                    tokio::spawn(async move {
-                                        if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                            error!("Connection error: {e}");
-                                        }
-                                    });
+                                    // let exit_code = channel.exit_status().expect("Failed to get exit code");
+                                    // if exit_code != 0 {
+                                    //     error!("Command execution failed with exit code: {}", exit_code);
+                                    // }
+                                    connect_duplex(inbound, channel);
                                     continue;
                                 }
                                 (None, Some(remote_addr)) => {
                                     // It is assumed that after the jumping through the
                                     // jump list one is on a host from which the service
                                     // is reachable and already running.
-                                    let mut channel = session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await?;
+                                    let channel = session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await?;
                                     info!("SSH channel established ");
                                     info!("Connected to remote address: {}", remote_addr);
-                                    tokio::spawn(async move {
-                                        if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                            error!("Connection error: {e}");
-                                        }
-                                    });
+                                    connect_duplex(inbound, channel);
                                     continue
                                 }
                                 (None, None) => {
@@ -534,9 +768,8 @@ async fn run_server(
                                     return Err("Either a command or a remote address must be provided.".into());
                                 }
                             }
-                        }
-                    }
-                    Err(e) => error!("Failed to accept connection: {e}")
+                        },
+                    Err(e) => error!("Failed to accept connection: {e}"),
                 }
             }
         }
