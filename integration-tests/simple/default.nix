@@ -33,6 +33,8 @@
       environment.systemPackages = with pkgs; [
         wrk2
         oha
+        iperf3
+        sockperf
       ];
       networking = {
         hostName = "user"; # Define your hostname.
@@ -117,6 +119,8 @@
         initialPassword = davidPassword;
         packages = with pkgs; [
           socat
+          iperf3
+          sockperf
         ];
       };
       services = {
@@ -320,8 +324,12 @@ in
       assert user.succeed(r"""su -l alice -c "nc -N 127.0.0.1 8003 </dev/null" """) == "Hi\n", "Failed hostname chain connection with remote service and command using internal pipe"
       user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8004 -r 127.0.0.1:8000 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22'")
       assert user.succeed("su -l alice -c 'curl 127.0.0.1:8004'") == "Hello from NixOS!\n", "Failed hostname chain connection with local service"
-      user.succeed(r"wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8000/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8001/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8002/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8003/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8004/")
-      user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8000")
-      # print(user.succeed("cat /home/alice/.local/share/sshbind/sshbind.log"))
+      # user.succeed(r"wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8000/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8001/ &&  wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8004/")
+      # user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8000")
+      user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8070 -r 127.0.0.1:5201 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "iperf3 -s"'""")
+      user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8071 -r 127.0.0.1:11111 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "sockperf sr -i 127.0.0.1 -p 11111 --tcp"'""")
+      user.send_chars("iperf3 -c 127.0.0.1 -p 8070\n")
+      user.send_chars("sockperf pp -i 127.0.0.1 -p 8071 -m 350 -t 30 --tcp\n")
+      print(user.succeed("cat /home/alice/.local/share/sshbind/sshbind.log"))
     '';
   }

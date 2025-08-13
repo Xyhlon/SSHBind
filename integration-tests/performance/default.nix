@@ -23,6 +23,7 @@
         socat
         dig
         tcpkali
+        iperf
         sockperf
         stress-ng
         wrk2
@@ -76,6 +77,11 @@
           Hello from NixOS!
         '';
       };
+      environment.systemPackages = with pkgs; [
+        iperf
+        sockperf
+        stress-ng
+      ];
     };
   };
 in
@@ -118,12 +124,27 @@ in
       # Setup sops for alice
       setup_sops(user, "alice")
 
+      user.send_chars("alice\n")
+      user.sleep(1)
+      user.send_chars("alice\n")
+
+
       # Testing basic cli usage
       user.succeed("su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8000 -r 127.0.0.1:80 -j target:22 -s ~/secrets.yaml'")
       user.succeed("su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8001 -r 127.0.0.1:80 -j target:22 -s ~/secrets.yaml'")
       user.succeed("su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8002 -r 127.0.0.1:8000 -j target:22 -s ~/secrets.yaml'")
       user.succeed("su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8003 -r 127.0.0.1:8000 -j target:22 -s ~/secrets.yaml'")
+      user.succeed(r"""su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8004 -r 127.0.0.1:11111 -j target:22 -s ~/secrets.yaml -c "sockperf sr -i 127.0.0.1 -p 11111 --tcp"'""")
+      user.succeed(r"""su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8005 -r 127.0.0.1:5201 -j target:22 -s ~/secrets.yaml -c "iperf3 -s"'""")
 
-      user.succeed(r"wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8000/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8001/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8002/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8003/ ")
+      user.send_chars("iperf3 -c 127.0.0.1 -p 8005 &\n")
+      user.send_chars("btop\n")
+      print(user.succeed("cat /home/alice/.local/share/sshbind/sshbind_*"))
+
+      # user.succeed("sockperf pp -i 127.0.0.1 -p 8004 -m 350 -t 30 --tcp")
+      # user.succeed("sockperf ul -i 127.0.0.1 -p 8004 -m 200 -t 30 --mps 100000 --tcp")
+      # user.succeed("sockperf tp -i 127.0.0.1 -p 8004 -m 1400 -t 15 --tcp")
+      # user.succeed(r"wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8000/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8001/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8002/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8003/ ")
+
     '';
   }
