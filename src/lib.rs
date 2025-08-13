@@ -372,59 +372,7 @@ async fn userauth(
 // }
 
 // Kinda works but dies under repeated hard sockperf througput testing
-// fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
-// where
-//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-// {
-//     tokio::spawn(async move {
-//         let mut buf_a = vec![0u8; 16 * 1024];
-//         let mut buf_b = vec![0u8; 16 * 1024];
-//
-//         // Track whether each *direction* is still open:
-//         let mut a_to_b_open = true; // reading A, writing to B
-//         let mut b_to_a_open = true; // reading B, writing to A
-//
-//         // Handling this in that way is kinda sus, however afaik libssh2 channel
-//         // need to handle the shutdown of the write side manually.
-//         while a_to_b_open || b_to_a_open {
-//             tokio::select! {
-//                 // A -> B
-//                 res = a.read(&mut buf_a), if a_to_b_open => {
-//                     match res {
-//                         Ok(0) => {
-//                             // A sent EOF: stop writing to B
-//                             a_to_b_open = false;
-//                             let _ = b.shutdown().await; // half-close B's write side
-//                         }
-//                         Ok(n) => b.write_all(&buf_a[..n]).await?,
-//                         Err(e) => return Err(e),
-//                     }
-//                 }
-//
-//                 // B -> A
-//                 res = b.read(&mut buf_b), if b_to_a_open => {
-//                     match res {
-//                         Ok(0) => {
-//                             // B sent EOF: stop writing to A
-//                             b_to_a_open = false;
-//                             let _ = a.shutdown().await; // half-close A's write side
-//                         }
-//                         Ok(n) => a.write_all(&buf_b[..n]).await?,
-//                         Err(e) => return Err(e),
-//                     }
-//                 }
-//             }
-//         }
-//
-//         Ok(())
-//     })
-// }
-
-fn connect_duplex<A, B>(
-    mut a: A,
-    mut b: async_ssh2_lite::AsyncChannel<B>,
-) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -447,10 +395,7 @@ where
                         Ok(0) => {
                             // A sent EOF: stop writing to B
                             a_to_b_open = false;
-                            let _ = b.send_eof().await;
-                            let _ = b.wait_eof().await;
-                            let _ = b.close().await;
-
+                            let _ = b.shutdown().await; // half-close B's write side
                         }
                         Ok(n) => b.write_all(&buf_a[..n]).await?,
                         Err(e) => return Err(e),
@@ -475,6 +420,58 @@ where
         Ok(())
     })
 }
+
+// fn connect_duplex<A, B>(
+//     mut a: A,
+//     mut b: async_ssh2_lite::AsyncChannel<B>,
+// ) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+// where
+//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+// {
+//     tokio::spawn(async move {
+//         let mut buf_a = vec![0u8; 16 * 1024];
+//         let mut buf_b = vec![0u8; 16 * 1024];
+//
+//         // Track whether each *direction* is still open:
+//         let mut a_to_b_open = true; // reading A, writing to B
+//         let mut b_to_a_open = true; // reading B, writing to A
+//
+//         // Handling this in that way is kinda sus, however afaik libssh2 channel
+//         // need to handle the shutdown of the write side manually.
+//         while a_to_b_open || b_to_a_open {
+//             tokio::select! {
+//                 // A -> B
+//                 res = a.read(&mut buf_a), if a_to_b_open => {
+//                     match res {
+//                         Ok(0) => {
+//                             // A sent EOF: stop writing to B
+//                             a_to_b_open = false;
+//
+//                         }
+//                         Ok(n) => b.write_all(&buf_a[..n]).await?,
+//                         Err(e) => return Err(e),
+//                     }
+//                 }
+//
+//                 // B -> A
+//                 res = b.read(&mut buf_b), if b_to_a_open => {
+//                     match res {
+//                         Ok(0) => {
+//                             // B sent EOF: stop writing to A
+//                             b_to_a_open = false;
+//                             let _ = a.shutdown().await; // half-close A's write side
+//                         }
+//                         Ok(n) => a.write_all(&buf_b[..n]).await?,
+//                         Err(e) => return Err(e),
+//                     }
+//                 }
+//             }
+//         }
+//
+//         Ok(())
+//     })
+// }
 
 // Doesn't really work but it is the recommended way for forwarding the stream
 // https://github.com/bk-rs/ssh-rs/blob/main/async-ssh2-lite/demos/smol/src/proxy_jump.rs
