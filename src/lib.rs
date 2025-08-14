@@ -373,6 +373,10 @@ where
                                   total_a_to_b, total_b_to_a);
                             break;
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // Add a small delay to prevent busy-waiting
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
                         Err(e) => {
                             error!("Read error from A: {}", e);
                             return Err(e);
@@ -400,6 +404,10 @@ where
                                   total_a_to_b, total_b_to_a);
                             break;
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            // Add a small delay to prevent busy-waiting
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
                         Err(e) => {
                             error!("Read error from B: {}", e);
                             return Err(e);
@@ -423,6 +431,7 @@ where
     tokio::spawn(async move {
         let mut buf_a = vec![0u8; 64 * 1024];
         let mut buf_b = vec![0u8; 64 * 1024];
+        let mut consecutive_errors = 0;
 
         loop {
             tokio::select! {
@@ -430,6 +439,7 @@ where
                     match res {
                         Ok(0) => break, // EOF
                         Ok(n) => {
+                            consecutive_errors = 0;
                             if let Err(e) = b.write_all(&buf_a[..n]).await {
                                 if e.kind() != std::io::ErrorKind::BrokenPipe {
                                     error!("Write error in chain tunnel: {}", e);
@@ -438,6 +448,15 @@ where
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            consecutive_errors += 1;
+                            if consecutive_errors > 100 {
+                                // Too many WouldBlock errors, likely stuck
+                                break;
+                            }
+                            // Add a small delay to prevent busy-waiting
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
                         Err(e) => {
                             error!("Read error in chain tunnel: {}", e);
                             return Err(e);
@@ -448,6 +467,7 @@ where
                     match res {
                         Ok(0) => break, // EOF
                         Ok(n) => {
+                            consecutive_errors = 0;
                             if let Err(e) = a.write_all(&buf_b[..n]).await {
                                 if e.kind() != std::io::ErrorKind::BrokenPipe {
                                     error!("Write error in chain tunnel: {}", e);
@@ -456,6 +476,15 @@ where
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            consecutive_errors += 1;
+                            if consecutive_errors > 100 {
+                                // Too many WouldBlock errors, likely stuck
+                                break;
+                            }
+                            // Add a small delay to prevent busy-waiting
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
                         Err(e) => {
                             error!("Read error in chain tunnel: {}", e);
                             return Err(e);
