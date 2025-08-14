@@ -11,15 +11,17 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
-use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
+use async_ssh2_lite::{
+    AsyncChannel, AsyncSession, AsyncSessionStream, SessionConfiguration, TokioTcpStream,
+};
 use libreauth::oath::TOTPBuilder;
 use ssh2_config::{ParseRule, SshConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
 use log::{error, info, warn};
@@ -334,84 +336,130 @@ async fn userauth(
     }
 }
 
-// Same as recommended way
-// fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
-// where
-//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-// {
-//     tokio::spawn(async move {
-//         let mut buf_a = vec![0u8; 16 * 1024];
-//         let mut buf_b = vec![0u8; 16 * 1024];
-//
-//         loop {
-//             tokio::select! {
-//                 res = a.read(&mut buf_a) => {
-//                     match res {
-//                         Ok(0) => {
-//                             break;
-//                         }
-//                         Ok(n) => b.write_all(&buf_a[..n]).await?,
-//                         Err(e) => return Err(e),
-//                     }
-//                 }
-//                 res = b.read(&mut buf_b) => {
-//                     match res {
-//                         Ok(0) => {
-//                             break;
-//                         }
-//                         Ok(n) => a.write_all(&buf_b[..n]).await?,
-//                         Err(e) => return Err(e),
-//                     }
-//                 }
-//             }
-//         }
-//
-//         Ok(())
-//     })
-// }
-
-// Kinda works but dies under repeated hard sockperf througput testing
+// Generic bidirectional copy function for both TCP and SSH connections
+// Now works correctly with the patched async-ssh2-lite
 fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut buf_a = vec![0u8; 16 * 1024];
-        let mut buf_b = vec![0u8; 16 * 1024];
+        // Use manual copying for better control and debugging
+        let mut buf_a = vec![0u8; 64 * 1024];
+        let mut buf_b = vec![0u8; 64 * 1024];
+        let mut total_a_to_b = 0u64;
+        let mut total_b_to_a = 0u64;
 
-        // Track whether each *direction* is still open:
-        let mut a_to_b_open = true; // reading A, writing to B
-        let mut b_to_a_open = true; // reading B, writing to A
-
-        // Handling this in that way is kinda sus, however afaik libssh2 channel
-        // need to handle the shutdown of the write side manually.
-        while a_to_b_open || b_to_a_open {
+        loop {
             tokio::select! {
-                // A -> B
-                res = a.read(&mut buf_a), if a_to_b_open => {
+                res = a.read(&mut buf_a) => {
                     match res {
                         Ok(0) => {
-                            // A sent EOF: stop writing to B
-                            a_to_b_open = false;
-                            let _ = b.shutdown().await; // half-close B's write side
+                            info!("Connection closed by A. Total transferred {} bytes A->B, {} bytes B->A",
+                                  total_a_to_b, total_b_to_a);
+                            break;
                         }
-                        Ok(n) => b.write_all(&buf_a[..n]).await?,
-                        Err(e) => return Err(e),
+                        Ok(n) => {
+                            if let Err(e) = b.write_all(&buf_a[..n]).await {
+                                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                                    error!("Write error A->B: {}", e);
+                                }
+                                break;
+                            }
+                            total_a_to_b += n as u64;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            info!("EOF from A. Total transferred {} bytes A->B, {} bytes B->A",
+                                  total_a_to_b, total_b_to_a);
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Read error from A: {}", e);
+                            return Err(e);
+                        }
                     }
                 }
-
-                // B -> A
-                res = b.read(&mut buf_b), if b_to_a_open => {
+                res = b.read(&mut buf_b) => {
                     match res {
                         Ok(0) => {
-                            // B sent EOF: stop writing to A
-                            b_to_a_open = false;
-                            let _ = a.shutdown().await; // half-close A's write side
+                            info!("Connection closed by B. Total transferred {} bytes A->B, {} bytes B->A",
+                                  total_a_to_b, total_b_to_a);
+                            break;
                         }
-                        Ok(n) => a.write_all(&buf_b[..n]).await?,
-                        Err(e) => return Err(e),
+                        Ok(n) => {
+                            if let Err(e) = a.write_all(&buf_b[..n]).await {
+                                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                                    error!("Write error B->A: {}", e);
+                                }
+                                break;
+                            }
+                            total_b_to_a += n as u64;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            info!("EOF from B. Total transferred {} bytes A->B, {} bytes B->A",
+                                  total_a_to_b, total_b_to_a);
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Read error from B: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    })
+}
+
+// Special version for chain connections that needs to keep the tunnel open
+// Uses manual copying to ensure the connection stays alive
+fn connect_chain_tunnel<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+where
+    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buf_a = vec![0u8; 64 * 1024];
+        let mut buf_b = vec![0u8; 64 * 1024];
+
+        loop {
+            tokio::select! {
+                res = a.read(&mut buf_a) => {
+                    match res {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            if let Err(e) = b.write_all(&buf_a[..n]).await {
+                                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                                    error!("Write error in chain tunnel: {}", e);
+                                }
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => {
+                            error!("Read error in chain tunnel: {}", e);
+                            return Err(e);
+                        }
+                    }
+                }
+                res = b.read(&mut buf_b) => {
+                    match res {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            if let Err(e) = a.write_all(&buf_b[..n]).await {
+                                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                                    error!("Write error in chain tunnel: {}", e);
+                                }
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => {
+                            error!("Read error in chain tunnel: {}", e);
+                            return Err(e);
+                        }
                     }
                 }
             }
@@ -616,7 +664,8 @@ async fn connect_chain(
         let client_conn = TokioTcpStream::connect(local_addr).await?;
         let server_conn = accept_task.await?.map_err(|e| e.to_string())?;
 
-        connect_duplex(server_conn, channel);
+        // Use the chain tunnel version to keep the connection alive
+        connect_chain_tunnel(server_conn, channel);
 
         session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
         session.handshake().await?;
@@ -672,6 +721,7 @@ async fn run_server(
     let remote_addr = remote_addr.as_ref();
     let session = connect_chain(&jump_hosts, &creds).await?;
     info!("SSH session established");
+    let sem = tokio::sync::Semaphore::new(1);
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
@@ -679,6 +729,7 @@ async fn run_server(
                 break;
             }
             result = listener.accept() => {
+                let _permit = sem.acquire().await.ok();
                 match result {
                     Ok((inbound, _)) if jump_hosts.is_empty() => {
                             let socket = remote_addr
@@ -688,7 +739,11 @@ async fn run_server(
                                 .next()
                                 .expect("Failed to resolve remote address");
                             let outbound = TokioTcpStream::connect(socket).await?;
+
                             connect_duplex(inbound, outbound);
+                            // tokio::spawn(async move {
+                            //     let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                            // });
                         },
                    Ok((inbound, _))  => {
                             info!("Command executed: {}", cmd.unwrap_or("No command provided"));
@@ -701,10 +756,10 @@ async fn run_server(
                                     info!("SSH channel established ");
                                     channel.exec(cmd).await?;
 
-                                    let _ = channel.send_eof().await;
-                                    let _ = channel.wait_eof().await;
-                                    let _ = channel.close().await;
-                                    let _ = channel.wait_close().await;
+                                    // let _ = channel.send_eof().await;
+                                    // let _ = channel.wait_eof().await;
+                                    // let _ = channel.close().await;
+                                    // let _ = channel.wait_close().await;
                                     // let exit_code = channel.exit_status().expect("Failed to get exit code");
                                     // if exit_code != 0 {
                                     //     error!("Command execution failed with exit code: {}", exit_code);
@@ -771,6 +826,9 @@ async fn run_server(
             }
         }
     }
+    session
+        .disconnect(None, "Closing Session caused by unbind request", None)
+        .await?;
     Ok(())
 }
 

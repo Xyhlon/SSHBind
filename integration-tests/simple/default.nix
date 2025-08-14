@@ -319,9 +319,9 @@ in
       user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8001 -r host-target:80 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22'")
       assert user.succeed("su -l alice -c 'curl 127.0.0.1:8001'") == "Hello from NixOS!\n", "Failed hostname chain connection with remote service"
       user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8002 -r 127.0.0.1:12345 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "socat TCP-LISTEN:12345,fork EXEC:cat"'""")
-      assert user.succeed(r"""su -l alice -c "printf 'Hello Nixos!\n' | nc -N -w 3 127.0.0.1 8002" """) == "Hello Nixos!\n", "Failed hostname chain connection with remote service and command"
+      assert user.succeed(r"""su -l alice -c "printf 'Hello Nixos!\n' | nc -w 3 127.0.0.1 8002" """) == "Hello Nixos!\n", "Failed hostname chain connection with remote service and command"
       user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8003 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "echo \"Hi\""'""")
-      assert user.succeed(r"""su -l alice -c "nc -N 127.0.0.1 8003 </dev/null" """) == "Hi\n", "Failed hostname chain connection with remote service and command using internal pipe"
+      assert user.succeed(r"""su -l alice -c "nc 127.0.0.1 8003 </dev/null" """) == "Hi\n", "Failed hostname chain connection with remote service and command using internal pipe"
       user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8004 -r 127.0.0.1:8000 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22'")
       assert user.succeed("su -l alice -c 'curl 127.0.0.1:8004'") == "Hello from NixOS!\n", "Failed hostname chain connection with local service"
       # user.succeed(r"wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8000/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8001/ &&  wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8004/")
