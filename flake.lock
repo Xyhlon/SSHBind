@@ -145,6 +145,22 @@
         "type": "github"
       }
     },
+    "nixpkgs-unstable": {
+      "locked": {
+        "lastModified": 1755049066,
+        "narHash": "sha256-ANrc15FSoOAdNbfKHxqEJjZLftIwIsenJGRb/04K41s=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e45f8f193029378d0aaee5431ba098dc80054e9a",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixpkgs-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "nixpkgs_2": {
       "locked": {
         "lastModified": 1730768919,
@@ -188,7 +204,9 @@
         "fenix": "fenix",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs",
+        "nixpkgs-unstable": "nixpkgs-unstable",
         "pre-commit-hooks": "pre-commit-hooks",
+        "ssh-rs-src": "ssh-rs-src",
         "statix": "statix"
       }
     },
@@ -206,6 +224,22 @@
         "owner": "rust-lang",
         "ref": "nightly",
         "repo": "rust-analyzer",
+        "type": "github"
+      }
+    },
+    "ssh-rs-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1755101273,
+        "narHash": "sha256-vrSAH0SW3c2g9qUVGM990QfKXknwOW7hRUVTVgcRdDc=",
+        "owner": "krystophny",
+        "repo": "ssh-rs",
+        "rev": "95a6cd0d4a281870b0e25e9a5816c01c0dd81f30",
+        "type": "github"
+      },
+      "original": {
+        "owner": "krystophny",
+        "repo": "ssh-rs",
         "type": "github"
       }
     },
