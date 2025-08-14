@@ -12,7 +12,7 @@ use url::{Host, Url};
 
 use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
 use async_ssh2_lite::{
-    AsyncChannel, AsyncSession, AsyncSessionStream, SessionConfiguration, TokioTcpStream,
+    AsyncSession, SessionConfiguration, TokioTcpStream,
 };
 use libreauth::oath::TOTPBuilder;
 use ssh2_config::{ParseRule, SshConfig};
@@ -352,6 +352,8 @@ where
 
         loop {
             tokio::select! {
+                biased; // Process branches in order, not randomly
+
                 res = a.read(&mut buf_a) => {
                     match res {
                         Ok(0) => {
@@ -374,8 +376,9 @@ where
                             break;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // Add a small delay to prevent busy-waiting
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            // This should never happen in proper async code
+                            // But if it does, yield to prevent busy-waiting
+                            tokio::task::yield_now().await;
                         }
                         Err(e) => {
                             error!("Read error from A: {}", e);
@@ -405,8 +408,9 @@ where
                             break;
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // Add a small delay to prevent busy-waiting
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            // This should never happen in proper async code
+                            // But if it does, yield to prevent busy-waiting
+                            tokio::task::yield_now().await;
                         }
                         Err(e) => {
                             error!("Read error from B: {}", e);
@@ -431,15 +435,15 @@ where
     tokio::spawn(async move {
         let mut buf_a = vec![0u8; 64 * 1024];
         let mut buf_b = vec![0u8; 64 * 1024];
-        let mut consecutive_errors = 0;
 
         loop {
             tokio::select! {
+                biased; // Process branches in order, not randomly
+
                 res = a.read(&mut buf_a) => {
                     match res {
                         Ok(0) => break, // EOF
                         Ok(n) => {
-                            consecutive_errors = 0;
                             if let Err(e) = b.write_all(&buf_a[..n]).await {
                                 if e.kind() != std::io::ErrorKind::BrokenPipe {
                                     error!("Write error in chain tunnel: {}", e);
@@ -449,13 +453,9 @@ where
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            consecutive_errors += 1;
-                            if consecutive_errors > 100 {
-                                // Too many WouldBlock errors, likely stuck
-                                break;
-                            }
-                            // Add a small delay to prevent busy-waiting
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            // This should never happen in proper async code
+                            // But if it does, yield to prevent busy-waiting
+                            tokio::task::yield_now().await;
                         }
                         Err(e) => {
                             error!("Read error in chain tunnel: {}", e);
@@ -467,7 +467,6 @@ where
                     match res {
                         Ok(0) => break, // EOF
                         Ok(n) => {
-                            consecutive_errors = 0;
                             if let Err(e) = a.write_all(&buf_b[..n]).await {
                                 if e.kind() != std::io::ErrorKind::BrokenPipe {
                                     error!("Write error in chain tunnel: {}", e);
@@ -477,13 +476,9 @@ where
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            consecutive_errors += 1;
-                            if consecutive_errors > 100 {
-                                // Too many WouldBlock errors, likely stuck
-                                break;
-                            }
-                            // Add a small delay to prevent busy-waiting
-                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                            // This should never happen in proper async code
+                            // But if it does, yield to prevent busy-waiting
+                            tokio::task::yield_now().await;
                         }
                         Err(e) => {
                             error!("Read error in chain tunnel: {}", e);
