@@ -11,17 +11,16 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
-use async_ssh2_lite::{
-    AsyncSession, SessionConfiguration, TokioTcpStream,
-};
+use async_ssh2_lite::{AsyncSession, AsyncSessionStream, SessionConfiguration, TokioTcpStream};
 use libreauth::oath::TOTPBuilder;
 use ssh2_config::{ParseRule, SshConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::copy_bidirectional;
 use tokio::io::{AsyncRead, AsyncWrite};
+// use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use log::{error, info, warn};
@@ -338,88 +337,120 @@ async fn userauth(
 
 // Generic bidirectional copy function for both TCP and SSH connections
 // Now works correctly with the patched async-ssh2-lite
-fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+fn connect_duplex<A, B>(
+    mut a: A,
+    mut b: B,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<tokio::io::Result<()>>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        // Use manual copying for better control and debugging
-        let mut buf_a = vec![0u8; 64 * 1024];
-        let mut buf_b = vec![0u8; 64 * 1024];
-        let mut total_a_to_b = 0u64;
-        let mut total_b_to_a = 0u64;
-
-        loop {
-            tokio::select! {
-                biased; // Process branches in order, not randomly
-
-                res = a.read(&mut buf_a) => {
-                    match res {
-                        Ok(0) => {
-                            info!("Connection closed by A. Total transferred {} bytes A->B, {} bytes B->A",
-                                  total_a_to_b, total_b_to_a);
-                            break;
-                        }
-                        Ok(n) => {
-                            if let Err(e) = b.write_all(&buf_a[..n]).await {
-                                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                                    error!("Write error A->B: {}", e);
-                                }
-                                break;
-                            }
-                            total_a_to_b += n as u64;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                            info!("EOF from A. Total transferred {} bytes A->B, {} bytes B->A",
-                                  total_a_to_b, total_b_to_a);
-                            break;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // This should never happen in proper async code
-                            // But if it does, yield to prevent busy-waiting
-                            tokio::task::yield_now().await;
-                        }
-                        Err(e) => {
-                            error!("Read error from A: {}", e);
-                            return Err(e);
-                        }
-                    }
-                }
-                res = b.read(&mut buf_b) => {
-                    match res {
-                        Ok(0) => {
-                            info!("Connection closed by B. Total transferred {} bytes A->B, {} bytes B->A",
-                                  total_a_to_b, total_b_to_a);
-                            break;
-                        }
-                        Ok(n) => {
-                            if let Err(e) = a.write_all(&buf_b[..n]).await {
-                                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                                    error!("Write error B->A: {}", e);
-                                }
-                                break;
-                            }
-                            total_b_to_a += n as u64;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                            info!("EOF from B. Total transferred {} bytes A->B, {} bytes B->A",
-                                  total_a_to_b, total_b_to_a);
-                            break;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // This should never happen in proper async code
-                            // But if it does, yield to prevent busy-waiting
-                            tokio::task::yield_now().await;
-                        }
-                        Err(e) => {
-                            error!("Read error from B: {}", e);
-                            return Err(e);
-                        }
-                    }
+        info!("Data forwarding task starting");
+        tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    warn!("Tunnel Shutdown signal received. Client Connections Reset.");
+                },
+        result = copy_bidirectional(&mut a, &mut b) =>{
+        match &result {
+            Ok((bytes_a_to_b, bytes_b_to_a)) => {
+                info!(
+                    "Bridge completed: {} bytes A->B, {} bytes B->A",
+                    bytes_a_to_b, bytes_b_to_a
+                );
+            }
+            Err(e) => {
+                // Don't log broken pipe as error - it's normal when connections close
+                if e.kind() == std::io::ErrorKind::BrokenPipe
+                    || e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.to_string().contains("draining incoming flow")
+                {
+                    info!("Bridge closed: {}", e);
+                } else {
+                    error!("Bridge failed: {}", e);
                 }
             }
         }
+        }
+        }
+        // Use manual copying for better control and debugging
+        // let mut buf_a = vec![0u8; 64 * 1024];
+        // let mut buf_b = vec![0u8; 64 * 1024];
+        // let mut total_a_to_b = 0u64;
+        // let mut total_b_to_a = 0u64;
+        //
+        // loop {
+        //     tokio::select! {
+        //         biased; // Process branches in order, not randomly
+        //
+        //         res = a.read(&mut buf_a) => {
+        //             match res {
+        //                 Ok(0) => {
+        //                     info!("Connection closed by A. Total transferred {} bytes A->B, {} bytes B->A",
+        //                           total_a_to_b, total_b_to_a);
+        //                     break;
+        //                 }
+        //                 Ok(n) => {
+        //                     if let Err(e) = b.write_all(&buf_a[..n]).await {
+        //                         if e.kind() != std::io::ErrorKind::BrokenPipe {
+        //                             error!("Write error A->B: {}", e);
+        //                         }
+        //                         break;
+        //                     }
+        //                     total_a_to_b += n as u64;
+        //                 }
+        //                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        //                     info!("EOF from A. Total transferred {} bytes A->B, {} bytes B->A",
+        //                           total_a_to_b, total_b_to_a);
+        //                     break;
+        //                 }
+        //                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        //                     // This should never happen in proper async code
+        //                     // But if it does, yield to prevent busy-waiting
+        //                     tokio::task::yield_now().await;
+        //                 }
+        //                 Err(e) => {
+        //                     error!("Read error from A: {}", e);
+        //                     return Err(e);
+        //                 }
+        //             }
+        //         }
+        //         res = b.read(&mut buf_b) => {
+        //             match res {
+        //                 Ok(0) => {
+        //                     info!("Connection closed by B. Total transferred {} bytes A->B, {} bytes B->A",
+        //                           total_a_to_b, total_b_to_a);
+        //                     break;
+        //                 }
+        //                 Ok(n) => {
+        //                     if let Err(e) = a.write_all(&buf_b[..n]).await {
+        //                         if e.kind() != std::io::ErrorKind::BrokenPipe {
+        //                             error!("Write error B->A: {}", e);
+        //                         }
+        //                         break;
+        //                     }
+        //                     total_b_to_a += n as u64;
+        //                 }
+        //                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+        //                     info!("EOF from B. Total transferred {} bytes A->B, {} bytes B->A",
+        //                           total_a_to_b, total_b_to_a);
+        //                     break;
+        //                 }
+        //                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        //                     // This should never happen in proper async code
+        //                     // But if it does, yield to prevent busy-waiting
+        //                     tokio::task::yield_now().await;
+        //                 }
+        //                 Err(e) => {
+        //                     error!("Read error from B: {}", e);
+        //                     return Err(e);
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
 
         Ok(())
     })
@@ -427,67 +458,99 @@ where
 
 // Special version for chain connections that needs to keep the tunnel open
 // Uses manual copying to ensure the connection stays alive
-fn connect_chain_tunnel<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+fn connect_chain_tunnel<A, B>(
+    mut a: A,
+    mut b: B,
+    cancel_token: CancellationToken,
+) -> tokio::task::JoinHandle<tokio::io::Result<()>>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut buf_a = vec![0u8; 64 * 1024];
-        let mut buf_b = vec![0u8; 64 * 1024];
-
-        loop {
-            tokio::select! {
-                biased; // Process branches in order, not randomly
-
-                res = a.read(&mut buf_a) => {
-                    match res {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            if let Err(e) = b.write_all(&buf_a[..n]).await {
-                                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                                    error!("Write error in chain tunnel: {}", e);
-                                }
-                                break;
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // This should never happen in proper async code
-                            // But if it does, yield to prevent busy-waiting
-                            tokio::task::yield_now().await;
-                        }
-                        Err(e) => {
-                            error!("Read error in chain tunnel: {}", e);
-                            return Err(e);
-                        }
-                    }
-                }
-                res = b.read(&mut buf_b) => {
-                    match res {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            if let Err(e) = a.write_all(&buf_b[..n]).await {
-                                if e.kind() != std::io::ErrorKind::BrokenPipe {
-                                    error!("Write error in chain tunnel: {}", e);
-                                }
-                                break;
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            // This should never happen in proper async code
-                            // But if it does, yield to prevent busy-waiting
-                            tokio::task::yield_now().await;
-                        }
-                        Err(e) => {
-                            error!("Read error in chain tunnel: {}", e);
-                            return Err(e);
-                        }
-                    }
+        info!("Bridge task starting");
+        tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    warn!("Shutdown signal received. Stopping server.");
+                },
+        result = copy_bidirectional(&mut a, &mut b) =>{
+        match &result {
+            Ok((bytes_a_to_b, bytes_b_to_a)) => {
+                info!(
+                    "Bridge completed: {} bytes A->B, {} bytes B->A",
+                    bytes_a_to_b, bytes_b_to_a
+                );
+            }
+            Err(e) => {
+                // Don't log broken pipe as error - it's normal when connections close
+                if e.kind() == std::io::ErrorKind::BrokenPipe
+                    || e.kind() == std::io::ErrorKind::ConnectionReset
+                    || e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.to_string().contains("draining incoming flow")
+                {
+                    info!("Bridge closed: {}", e);
+                } else {
+                    error!("Bridge failed: {}", e);
                 }
             }
         }
+        }
+        }
+        // let mut buf_a = vec![0u8; 64 * 1024];
+        // let mut buf_b = vec![0u8; 64 * 1024];
+        //
+        // loop {
+        //     tokio::select! {
+        //         biased; // Process branches in order, not randomly
+        //
+        //         res = a.read(&mut buf_a) => {
+        //             match res {
+        //                 Ok(0) => break, // EOF
+        //                 Ok(n) => {
+        //                     if let Err(e) = b.write_all(&buf_a[..n]).await {
+        //                         if e.kind() != std::io::ErrorKind::BrokenPipe {
+        //                             error!("Write error in chain tunnel: {}", e);
+        //                         }
+        //                         break;
+        //                     }
+        //                 }
+        //                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+        //                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        //                     // This should never happen in proper async code
+        //                     // But if it does, yield to prevent busy-waiting
+        //                     tokio::task::yield_now().await;
+        //                 }
+        //                 Err(e) => {
+        //                     error!("Read error in chain tunnel: {}", e);
+        //                     return Err(e);
+        //                 }
+        //             }
+        //         }
+        //         res = b.read(&mut buf_b) => {
+        //             match res {
+        //                 Ok(0) => break, // EOF
+        //                 Ok(n) => {
+        //                     if let Err(e) = a.write_all(&buf_b[..n]).await {
+        //                         if e.kind() != std::io::ErrorKind::BrokenPipe {
+        //                             error!("Write error in chain tunnel: {}", e);
+        //                         }
+        //                         break;
+        //                     }
+        //                 }
+        //                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+        //                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        //                     // This should never happen in proper async code
+        //                     // But if it does, yield to prevent busy-waiting
+        //                     tokio::task::yield_now().await;
+        //                 }
+        //                 Err(e) => {
+        //                     error!("Read error in chain tunnel: {}", e);
+        //                     return Err(e);
+        //                 }
+        //             }
+        //         }
+        //     }
+        // }
 
         Ok(())
     })
@@ -665,6 +728,7 @@ where
 async fn connect_chain(
     jump_hosts: &[HostPort],
     creds_map: &YamlCreds,
+    cancel_token: CancellationToken,
 ) -> Result<AsyncSession<TokioTcpStream>, Box<dyn Error>> {
     assert!(!jump_hosts.is_empty(), "No jump hosts provided");
     info!("Starting SSH chain connection through {:?}", jump_hosts);
@@ -675,12 +739,15 @@ async fn connect_chain(
 
     for (i, jump) in jump_hosts.iter().enumerate().skip(1) {
         info!("Connecting through jump {}: {}", i, jump);
+        info!("Creating channel to {}:{}", jump.host, jump.port);
         let channel = session
             .channel_direct_tcpip(&jump.host, jump.port, None)
             .await?;
+        info!("Channel created successfully!");
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let local_addr = listener.local_addr()?;
+        info!("Local bridge listening on {}", local_addr);
 
         let accept_task =
             tokio::spawn(async move { listener.accept().await.map(|(local_conn, _)| local_conn) });
@@ -689,7 +756,10 @@ async fn connect_chain(
         let server_conn = accept_task.await?.map_err(|e| e.to_string())?;
 
         // Use the chain tunnel version to keep the connection alive
-        connect_chain_tunnel(server_conn, channel);
+        connect_chain_tunnel(server_conn, channel, cancel_token.clone());
+
+        // Give the bridge task a moment to start
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
         session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
         session.handshake().await?;
@@ -697,6 +767,119 @@ async fn connect_chain(
     }
 
     Ok(session)
+}
+
+async fn connect_to_tunnel<S>(
+    inbound: TokioTcpStream,
+    session: AsyncSession<S>,
+    jump_hosts: &[HostPort],
+    remote_addr: Option<&HostPort>,
+    cmd: Option<&str>,
+    cancel_token: CancellationToken,
+) -> Result<(), Box<dyn Error>>
+where
+    S: AsyncSessionStream + Send + Sync + 'static,
+{
+    if jump_hosts.is_empty() {
+        let socket = remote_addr
+            .expect("Remote address is required when no jump hosts are provided")
+            .to_string()
+            .to_socket_addrs()?
+            .next()
+            .expect("Failed to resolve remote address");
+        let outbound = TokioTcpStream::connect(socket).await?;
+
+        connect_duplex(inbound, outbound, cancel_token.clone());
+        // tokio::spawn(async move {
+        //     let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+        // });
+    } else {
+        info!("Command executed: {}", cmd.unwrap_or("No command provided"));
+        match (cmd, remote_addr) {
+            (Some(cmd), Some(remote_addr)) => {
+                // Execute the command on the remote server and
+                // then assume a local socket is opened to which
+                // we can connect to on the remote_addr.
+                let mut channel = session.channel_session().await?; // dies here
+                info!("SSH channel established ");
+                channel.exec(cmd).await?;
+
+                // let _ = channel.send_eof().await;
+                // let _ = channel.wait_eof().await;
+                // let _ = channel.close().await;
+                // let _ = channel.wait_close().await;
+                // let exit_code = channel.exit_status().expect("Failed to get exit code");
+                // if exit_code != 0 {
+                //     error!("Command execution failed with exit code: {}", exit_code);
+                // }
+                // Wait for started service to be ready
+                // I know this isn't the cleanest solution
+                // open for suggestions
+                let mut counter = 0;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                loop {
+                    match session
+                        .channel_direct_tcpip(&remote_addr.host, remote_addr.port, None)
+                        .await
+                    {
+                        Ok(channel) => {
+                            info!("SSH channel established ");
+                            info!("Connected to remote address: {}", remote_addr);
+                            connect_duplex(inbound, channel, cancel_token.clone());
+                            break;
+                        }
+                        Err(err) => {
+                            if counter >= 10 {
+                                error!("Failed to connect to remote address {} after 10 attempts: {err}", remote_addr);
+                                return Err(err.into());
+                            }
+                            counter += 1;
+
+                            // Exponential backoff for high concurrency
+                            let delay = 50;
+                            error!("remote not ready yet: {err}, retrying in {}ms…", delay);
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                        }
+                    }
+                }
+            }
+            (Some(cmd), None) => {
+                // Execute the command on the remote server and
+                // then assume since no remote_addr is provided
+                // that communication is done over via stdio over
+                // the channel.
+                let mut channel = session.channel_session().await?;
+                info!("SSH channel established ");
+                channel.exec(cmd).await?;
+                // let exit_code = channel.exit_status().expect("Failed to get exit code");
+                // if exit_code != 0 {
+                //     error!("Command execution failed with exit code: {}", exit_code);
+                // }
+                connect_duplex(inbound, channel, cancel_token.clone());
+            }
+            (None, Some(remote_addr)) => {
+                // It is assumed that after the jumping through the
+                // jump list one is on a host from which the service
+                // is reachable and already running.
+                match session
+                    .channel_direct_tcpip(&remote_addr.host, remote_addr.port, None)
+                    .await
+                {
+                    Ok(channel) => {
+                        info!("SSH channel established ");
+                        info!("Connected to remote address: {}", remote_addr);
+                        connect_duplex(inbound, channel, cancel_token.clone());
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            (None, None) => {
+                error!("Either a command or a remote address must be provided.");
+                return Err("Either a command or a remote address must be provided.".into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Runs an asynchronous TCP server that listens for incoming connections and forwards them
@@ -743,110 +926,43 @@ async fn run_server(
         cvar.notify_one();
     }
     let remote_addr = remote_addr.as_ref();
-    let session = connect_chain(&jump_hosts, &creds).await?;
+    let mut tunnel_cancel_token = CancellationToken::new();
+    let mut session = connect_chain(&jump_hosts, &creds, tunnel_cancel_token.clone()).await?;
     info!("SSH session established");
     let sem = tokio::sync::Semaphore::new(1);
     loop {
         tokio::select! {
-            _ = cancel_token.cancelled() => {
-                warn!("Shutdown signal received. Stopping server.");
-                break;
-            }
-            result = listener.accept() => {
-                let _permit = sem.acquire().await.ok();
-                match result {
-                    Ok((inbound, _)) if jump_hosts.is_empty() => {
-                            let socket = remote_addr
-                                .expect("Remote address is required when no jump hosts are provided")
-                                .to_string()
-                                .to_socket_addrs()?
-                                .next()
-                                .expect("Failed to resolve remote address");
-                            let outbound = TokioTcpStream::connect(socket).await?;
-
-                            connect_duplex(inbound, outbound);
-                            // tokio::spawn(async move {
-                            //     let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
-                            // });
-                        },
-                   Ok((inbound, _))  => {
-                            info!("Command executed: {}", cmd.unwrap_or("No command provided"));
-                            match (cmd, remote_addr) {
-                                (Some(cmd), Some(remote_addr)) => {
-                                    // Execute the command on the remote server and
-                                    // then assume a local socket is opened to which
-                                    // we can connect to on the remote_addr.
-                                    let mut channel = session.channel_session().await?; // dies here
-                                    info!("SSH channel established ");
-                                    channel.exec(cmd).await?;
-
-                                    // let _ = channel.send_eof().await;
-                                    // let _ = channel.wait_eof().await;
-                                    // let _ = channel.close().await;
-                                    // let _ = channel.wait_close().await;
-                                    // let exit_code = channel.exit_status().expect("Failed to get exit code");
-                                    // if exit_code != 0 {
-                                    //     error!("Command execution failed with exit code: {}", exit_code);
-                                    // }
-                                    // Wait for started service to be ready
-                                    // I know this isn't the cleanest solution
-                                    // open for suggestions
-                                    let mut counter = 0;
-                                    loop {
-                                        match session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await {
-                                            Ok(channel) => {
-                                                info!("SSH channel established ");
-                                                info!("Connected to remote address: {}", remote_addr);
-                                                connect_duplex(inbound, channel);
-                                                break;
-                                            }
-                                            Err(err) => {
-                                                if counter >= 10 {
-                                                    error!("Failed to connect to remote address {} after 10 attempts: {err}", remote_addr);
-                                                    return Err(err.into());
-                                                }
-                                                counter += 1;
-
-                                                // If the connect failed, wait a bit and retry
-                                                error!("remote not ready yet: {err}, retrying…");
-                                                tokio::time::sleep(Duration::from_millis(100)).await;
-                                            }
-                                        }
-                                    }
-                                }
-                                (Some(cmd), None) => {
-                                    // Execute the command on the remote server and
-                                    // then assume since no remote_addr is provided
-                                    // that communication is done over via stdio over
-                                    // the channel.
-                                    let mut channel = session.channel_session().await?;
-                                    info!("SSH channel established ");
-                                    channel.exec(cmd).await?;
-                                    // let exit_code = channel.exit_status().expect("Failed to get exit code");
-                                    // if exit_code != 0 {
-                                    //     error!("Command execution failed with exit code: {}", exit_code);
-                                    // }
-                                    connect_duplex(inbound, channel);
-                                    continue;
-                                }
-                                (None, Some(remote_addr)) => {
-                                    // It is assumed that after the jumping through the
-                                    // jump list one is on a host from which the service
-                                    // is reachable and already running.
-                                    let channel = session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await?;
-                                    info!("SSH channel established ");
-                                    info!("Connected to remote address: {}", remote_addr);
-                                    connect_duplex(inbound, channel);
-                                    continue
-                                }
-                                (None, None) => {
-                                    error!("Either a command or a remote address must be provided.");
-                                    return Err("Either a command or a remote address must be provided.".into());
-                                }
-                            }
-                        },
-                    Err(e) => error!("Failed to accept connection: {e}"),
+                _ = cancel_token.cancelled() => {
+                    warn!("Shutdown signal received. Stopping server.");
+                    break;
                 }
+                sock_result = listener.accept() => {
+                    let _permit = sem.acquire().await.ok();
+                    let sock = match sock_result {
+                        Ok((sock, _)) => {
+                            sock
+                        }
+                        Err(e) => {
+                            error!("Failed to accept connection: {e}");
+                            return Err(e.into());
+                        }
+                    };
+                    let result = connect_to_tunnel(sock, session.clone(), &jump_hosts, remote_addr, cmd, tunnel_cancel_token.clone()).await;
+                    match result {
+                        Ok(_) => {
+                            continue;
+                        }
+                        Err(e) => {
+                            error!("Failed to connect to tunnel: {e}");
+                            info!("Rebuilding SSH session + Tunnel...");
+                            tunnel_cancel_token.cancel();
+                            tunnel_cancel_token = CancellationToken::new();
+                            session = connect_chain(&jump_hosts, &creds, tunnel_cancel_token.clone()).await?;
+                            info!("Tunnel is rebuild...");
+                            continue;
+                        }
+                    }
+
             }
         }
     }
