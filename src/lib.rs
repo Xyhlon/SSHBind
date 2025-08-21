@@ -394,89 +394,76 @@ async fn userauth(
 //     })
 // }
 
-// Duplex connection forwarding using manual polling instead of tokio::select
-fn connect_duplex<A, B>(mut a: A, mut b: B)
+// Duplex connection forwarding using separate spawned tasks
+fn connect_duplex<A, B>(a: A, b: B)
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Split streams for bidirectional forwarding
+    let (a_read, a_write) = a.split();
+    let (b_read, b_write) = b.split();
+    
+    // Spawn A -> B direction
     executor::spawn(async move {
-        let mut buf_a = vec![0u8; 16 * 1024];
-        let mut buf_b = vec![0u8; 16 * 1024];
-
-        // Track whether each *direction* is still open:
-        let mut a_to_b_open = true; // reading A, writing to B  
-        let mut b_to_a_open = true; // reading B, writing to A
-
-        let mut no_progress_count = 0;
-        const MAX_NO_PROGRESS: usize = 1000;
-
-        // Handling this in that way is kinda sus, however afaik libssh2 channel
-        // need to handle the shutdown of the write side manually.
-        while a_to_b_open || b_to_a_open {
-            let mut progress = false;
-
-            // Try A -> B
-            if a_to_b_open {
-                match a.read(&mut buf_a).await {
-                    Ok(0) => {
-                        // A sent EOF: stop writing to B
-                        a_to_b_open = false;
-                        let _ = AsyncWriteExt::close(&mut b).await; // half-close B's write side
-                        progress = true;
-                    }
-                    Ok(n) => {
-                        if let Err(e) = b.write_all(&buf_a[..n]).await {
-                            error!("Failed to write to B: {}", e);
-                            break;
-                        }
-                        progress = true;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available, continue to try B -> A
-                    }
-                    Err(e) => {
-                        error!("Read error from A: {}", e);
-                        break;
-                    }
-                }
-            }
-
-            // Try B -> A  
-            if b_to_a_open {
-                match b.read(&mut buf_b).await {
-                    Ok(0) => {
-                        // B sent EOF: stop writing to A
-                        b_to_a_open = false;
-                        let _ = AsyncWriteExt::close(&mut a).await; // half-close A's write side
-                        progress = true;
-                    }
-                    Ok(n) => {
-                        if let Err(e) = a.write_all(&buf_b[..n]).await {
-                            error!("Failed to write to A: {}", e);
-                            break;
-                        }
-                        progress = true;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        // No data available, continue polling
-                    }
-                    Err(e) => {
-                        error!("Read error from B: {}", e);
-                        break;
-                    }
-                }
-            }
-
-            // Small yield to prevent busy looping if no progress
-            if !progress {
-                no_progress_count += 1;
-                if no_progress_count > MAX_NO_PROGRESS {
-                    warn!("Connection forwarding stalled, breaking");
+        let mut a_read = a_read;
+        let mut b_write = b_write;
+        let mut buf = vec![0u8; 8192];
+        
+        loop {
+            match a_read.read(&mut buf).await {
+                Ok(0) => {
+                    // EOF from A, close B's write side
+                    let _ = b_write.close().await;
+                    info!("A->B direction closed (EOF)");
                     break;
                 }
-            } else {
-                no_progress_count = 0;
+                Ok(n) => {
+                    if let Err(e) = b_write.write_all(&buf[..n]).await {
+                        error!("A->B write failed: {}", e);
+                        break;
+                    }
+                    if let Err(e) = b_write.flush().await {
+                        error!("A->B flush failed: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("A->B read failed: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+    
+    // Spawn B -> A direction  
+    executor::spawn(async move {
+        let mut b_read = b_read;
+        let mut a_write = a_write;
+        let mut buf = vec![0u8; 8192];
+        
+        loop {
+            match b_read.read(&mut buf).await {
+                Ok(0) => {
+                    // EOF from B, close A's write side
+                    let _ = a_write.close().await;
+                    info!("B->A direction closed (EOF)");
+                    break;
+                }
+                Ok(n) => {
+                    if let Err(e) = a_write.write_all(&buf[..n]).await {
+                        error!("B->A write failed: {}", e);
+                        break;
+                    }
+                    if let Err(e) = a_write.flush().await {
+                        error!("B->A flush failed: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("B->A read failed: {}", e);
+                    break;
+                }
             }
         }
     });
