@@ -7,6 +7,7 @@ pub enum Error {
     Ssh2(ssh2::Error),
     Io(io::Error),
     Disconnected,
+    Timeout(String),
     Other(String),
 }
 
@@ -16,6 +17,7 @@ impl fmt::Display for Error {
             Error::Ssh2(e) => write!(f, "SSH error: {}", e),
             Error::Io(e) => write!(f, "I/O error: {}", e),
             Error::Disconnected => write!(f, "SSH session disconnected"),
+            Error::Timeout(msg) => write!(f, "Timeout: {}", msg),
             Error::Other(msg) => write!(f, "{}", msg),
         }
     }

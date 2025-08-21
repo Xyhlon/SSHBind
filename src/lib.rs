@@ -1,5 +1,7 @@
 // Custom async SSH wrapper module - replacement for async-ssh2-lite
 pub mod async_ssh;
+// Minimal single-threaded executor for async operations
+pub mod executor;
 
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
