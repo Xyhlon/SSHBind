@@ -6,6 +6,9 @@ mod session;
 mod channel;
 mod stream;
 
+#[cfg(test)]
+mod tests;
+
 pub use error::{Error, Result};
 pub use session::{AsyncSession, SessionConfiguration};
 pub use channel::AsyncChannel;

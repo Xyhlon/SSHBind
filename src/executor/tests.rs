@@ -26,17 +26,24 @@ fn test_spawn_runs_concurrently() {
     let counter1 = counter.clone();
     let counter2 = counter.clone();
     
-    spawn(async move {
-        counter1.fetch_add(1, Ordering::SeqCst);
+    let result = block_on(async move {
+        spawn(async move {
+            counter1.fetch_add(1, Ordering::SeqCst);
+        });
+        
+        spawn(async move {
+            counter2.fetch_add(1, Ordering::SeqCst);
+        });
+        
+        // Give tasks time to complete
+        for _ in 0..10 {
+            yield_now().await;
+        }
+        
+        Ok(())
     });
     
-    spawn(async move {
-        counter2.fetch_add(1, Ordering::SeqCst);
-    });
-    
-    // Give spawned tasks time to complete
-    std::thread::sleep(Duration::from_millis(100));
-    
+    assert!(result.is_ok());
     assert_eq!(counter.load(Ordering::SeqCst), 2);
 }
 

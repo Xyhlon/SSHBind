@@ -9,6 +9,9 @@ mod waker;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod io_tests;
+
 use std::future::Future;
 use std::task::{Context, Poll};
 use std::time::Duration;
