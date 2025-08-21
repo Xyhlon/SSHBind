@@ -120,7 +120,7 @@ impl Executor {
     }
 }
 
-/// Block on a future until it completes
+/// Block on a future until it completes  
 pub fn block_on<F, T: 'static>(future: F) -> Result<T>
 where
     F: Future<Output = Result<T>> + 'static,
@@ -130,6 +130,18 @@ where
     let mut executor = Executor::new()?;
     let result = Arc::new(Mutex::new(None));
     let result_clone = Arc::clone(&result);
+
+    // Add any pending tasks first
+    let pending_tasks = PENDING_TASKS.with(|pending| {
+        pending.borrow_mut().drain(..).collect::<Vec<_>>()
+    });
+    
+    for task in pending_tasks {
+        let task_id = executor.next_task_id;
+        executor.next_task_id.0 += 1;
+        let task = Task::new(task_id, task);
+        executor.task_queue.push_back(task);
+    }
 
     // Spawn the main future
     executor.spawn_task(async move {
@@ -154,22 +166,21 @@ where
     }
 }
 
-/// Spawn a future on the current executor
+/// Spawn a future on the global executor instance
 pub fn spawn<F>(future: F)
 where
     F: Future<Output = ()> + 'static,
 {
-    EXECUTOR.with(|executor_cell| {
-        let mut executor_opt = executor_cell.borrow_mut();
-        if let Some(executor) = executor_opt.as_mut() {
-            executor.spawn_task(future);
-        } else {
-            // No executor running, create temporary one
-            let mut executor = Executor::new().expect("Failed to create executor");
-            executor.spawn_task(future);
-            executor.run(None).expect("Failed to run executor");
-        }
+    // Always store in pending tasks - block_on will pick them up
+    PENDING_TASKS.with(|tasks| {
+        tasks.borrow_mut().push(Box::pin(future));
     });
+}
+
+// Thread-local storage for tasks spawned before executor starts
+thread_local! {
+    static PENDING_TASKS: std::cell::RefCell<Vec<std::pin::Pin<Box<dyn Future<Output = ()>>>>> = 
+        std::cell::RefCell::new(Vec::new());
 }
 
 /// Future that yields execution to other tasks

@@ -655,34 +655,28 @@ async fn connect_chain(
             .channel_direct_tcpip(&jump.host, jump.port, None, 0)
             .await?;
 
-        // Use standard TcpListener with manual async handling
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-        listener.set_nonblocking(true)?;
-        let local_addr = listener.local_addr()?;
-
-        // Convert to our AsyncTcpStream  
-        let client_conn = AsyncTcpStream::connect(local_addr).await?;
+        // Create a simple loopback connection using blocking I/O first
+        // This avoids the async timing issues
+        use std::net::{TcpListener, TcpStream};
         
-        // Accept connection manually without tokio::spawn
-        let server_conn = loop {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(true)?;
-                    break AsyncTcpStream::from_std(stream)?;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Wait a bit and retry
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    continue;
-                }
-                Err(e) => return Err(crate::async_ssh::Error::Other(format!("TcpListener accept error: {}", e))),
-            }
-        };
-
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let local_addr = listener.local_addr()?;
+        
+        // Create connection pair using blocking I/O
+        let client_stream = TcpStream::connect(local_addr)?;
+        let (server_stream, _) = listener.accept()?;
+        
+        client_stream.set_nonblocking(true)?;
+        server_stream.set_nonblocking(true)?;
+        
+        let client_conn = AsyncTcpStream::from_std(client_stream)?;
+        let server_conn = AsyncTcpStream::from_std(server_stream)?;
+        
+        // Start data forwarding between server connection and SSH channel
         connect_duplex(server_conn, channel);
 
         let ssh_session = ssh2::Session::new()?;
-        session = AsyncSession::from_parts(ssh_session, client_conn, SessionConfiguration::default());
+        session = AsyncSession::from_parts(ssh_session, client_conn, SessionConfiguration::default())?;
         session.handshake().await?;
         userauth(&session, creds_map, &jump_hosts[i]).await?;
     }

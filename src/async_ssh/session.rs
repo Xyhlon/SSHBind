@@ -66,12 +66,15 @@ impl AsyncSession {
 
 impl AsyncSession {
     // Create from existing session and stream
-    pub fn from_parts(session: Session, stream: AsyncTcpStream, config: SessionConfiguration) -> Self {
-        Self {
+    pub fn from_parts(mut session: Session, stream: AsyncTcpStream, config: SessionConfiguration) -> Result<Self> {
+        // Set TCP stream - this is required before handshake
+        session.set_tcp_stream(stream.inner().try_clone()?);
+        
+        Ok(Self {
             inner: Arc::new(Mutex::new(session)),
             stream: Arc::new(stream),
             config,
-        }
+        })
     }
 
     // Perform SSH handshake
