@@ -128,13 +128,23 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
     // Give servers time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    bind(
-        bind_addr,
-        jump_hosts,
-        service_addr,
-        sopsfile_path.to_str().unwrap(),
-        None,
-    );
+    // Run bind in a blocking task to avoid runtime conflicts
+    let bind_addr_clone = bind_addr.to_string();
+    let jump_hosts_clone = jump_hosts.clone();
+    let service_addr_clone = service_addr.clone();
+    let sopsfile_str = sopsfile_path.to_str().unwrap().to_string();
+    tokio::task::spawn_blocking(move || {
+        bind(
+            &bind_addr_clone,
+            jump_hosts_clone,
+            service_addr_clone,
+            &sopsfile_str,
+            None,
+        );
+    }).await.unwrap();
+
+    // Give bind time to start listening
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     info!("Bind started");
     let mut conn = TcpStream::connect(bind_addr).await.unwrap();
@@ -241,13 +251,20 @@ async fn serial_integration_test_correct_configuration_multiple(
     // Give servers time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    bind(
-        bind_addr,
-        jump_hosts,
-        service_addr,
-        sopsfile_path.to_str().unwrap(),
-        None,
-    );
+    // Run bind in a blocking task to avoid runtime conflicts
+    let bind_addr_clone = bind_addr.to_string();
+    let jump_hosts_clone = jump_hosts.clone();
+    let service_addr_clone = service_addr.clone();
+    let sopsfile_str = sopsfile_path.to_str().unwrap().to_string();
+    tokio::task::spawn_blocking(move || {
+        bind(
+            &bind_addr_clone,
+            jump_hosts_clone,
+            service_addr_clone,
+            &sopsfile_str,
+            None,
+        );
+    }).await.unwrap();
 
     let mut conn = TcpStream::connect(bind_addr).await.unwrap();
     let mut buf = vec![0; 1024];
@@ -361,13 +378,20 @@ async fn serial_integration_test_second_server_wrong_credentials(
     // Give servers time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    bind(
-        bind_addr,
-        jump_hosts,
-        service_addr,
-        sopsfile_path.to_str().unwrap(),
-        None,
-    );
+    // Run bind in a blocking task to avoid runtime conflicts
+    let bind_addr_clone = bind_addr.to_string();
+    let jump_hosts_clone = jump_hosts.clone();
+    let service_addr_clone = service_addr.clone();
+    let sopsfile_str = sopsfile_path.to_str().unwrap().to_string();
+    tokio::task::spawn_blocking(move || {
+        bind(
+            &bind_addr_clone,
+            jump_hosts_clone,
+            service_addr_clone,
+            &sopsfile_str,
+            None,
+        );
+    }).await.unwrap();
 
     let mut conn = TcpStream::connect(bind_addr).await.unwrap();
     let mut buf = vec![0; 1024];
@@ -459,13 +483,20 @@ async fn serial_integration_test_correct_configuration_2fa(
     // Give servers time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    bind(
-        bind_addr,
-        jump_hosts,
-        service_addr,
-        sopsfile_path.to_str().unwrap(),
-        None,
-    );
+    // Run bind in a blocking task to avoid runtime conflicts
+    let bind_addr_clone = bind_addr.to_string();
+    let jump_hosts_clone = jump_hosts.clone();
+    let service_addr_clone = service_addr.clone();
+    let sopsfile_str = sopsfile_path.to_str().unwrap().to_string();
+    tokio::task::spawn_blocking(move || {
+        bind(
+            &bind_addr_clone,
+            jump_hosts_clone,
+            service_addr_clone,
+            &sopsfile_str,
+            None,
+        );
+    }).await.unwrap();
 
     let mut conn = TcpStream::connect(bind_addr).await.unwrap();
     let mut buf = vec![0; 1024];
