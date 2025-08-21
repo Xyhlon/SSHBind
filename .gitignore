@@ -6,3 +6,4 @@ result*
 .nixos-test-history
 .sops.yaml
 secrets.yaml
+.tmp*
