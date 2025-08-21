@@ -74,12 +74,10 @@ impl Executor {
             // Poll all ready tasks
             self.poll_tasks()?;
 
-            // Wait for I/O events if we have pending tasks
+            // Poll I/O events with very short timeout to keep executor responsive
             if !self.task_queue.is_empty() {
-                let poll_timeout = timeout.map(|t| t.saturating_sub(start_time.elapsed()))
-                    .unwrap_or(Duration::from_millis(10));
-                
-                self.reactor.poll_events(poll_timeout)?;
+                // Use very short timeout to keep executor responsive for SSH handshakes
+                self.reactor.poll_events(Duration::from_micros(100))?;
             }
         }
 
@@ -89,7 +87,7 @@ impl Executor {
     fn poll_tasks(&mut self) -> Result<()> {
         let mut tasks_to_repoll = Vec::new();
         
-        // Poll each task once
+        // For debugging: always poll all tasks for now
         while let Some(mut task) = self.task_queue.pop_front() {
             let ssh_waker = SshBindWaker::new(task.id());
             let waker = ssh_waker.into_std_waker();
@@ -100,7 +98,7 @@ impl Executor {
                     // Task completed, don't re-queue
                 }
                 std::task::Poll::Pending => {
-                    // Task is waiting, re-queue for later
+                    // Task is waiting for I/O, re-queue for later
                     tasks_to_repoll.push(task);
                 }
             }

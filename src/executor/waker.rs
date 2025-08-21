@@ -4,13 +4,20 @@
 use std::sync::{Arc, Mutex};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 use std::collections::HashMap;
+use lazy_static::lazy_static;
 
 use super::TaskId;
+
+// Global waker registry shared across all executor instances
+lazy_static! {
+    static ref GLOBAL_WAKER_STATE: Arc<Mutex<WakerState>> = Arc::new(Mutex::new(WakerState {
+        woken_tasks: HashMap::new(),
+    }));
+}
 
 /// Waker implementation for SSHBind executor
 pub struct SshBindWaker {
     task_id: TaskId,
-    shared: Arc<Mutex<WakerState>>,
 }
 
 /// Shared state for waker management
@@ -21,23 +28,19 @@ struct WakerState {
 impl SshBindWaker {
     /// Create a new waker for the given task
     pub fn new(task_id: TaskId) -> Self {
-        let shared = Arc::new(Mutex::new(WakerState {
-            woken_tasks: HashMap::new(),
-        }));
-
-        Self { task_id, shared }
+        Self { task_id }
     }
 
     /// Wake the associated task
     pub fn wake(&self) {
-        if let Ok(mut state) = self.shared.lock() {
+        if let Ok(mut state) = GLOBAL_WAKER_STATE.lock() {
             state.woken_tasks.insert(self.task_id, true);
         }
     }
 
     /// Check if this task has been woken and clear the flag
     pub fn is_woken(&self) -> bool {
-        if let Ok(mut state) = self.shared.lock() {
+        if let Ok(mut state) = GLOBAL_WAKER_STATE.lock() {
             state.woken_tasks.remove(&self.task_id).unwrap_or(false)
         } else {
             false
@@ -60,7 +63,6 @@ impl Clone for SshBindWaker {
     fn clone(&self) -> Self {
         Self {
             task_id: self.task_id,
-            shared: Arc::clone(&self.shared),
         }
     }
 }

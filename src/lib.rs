@@ -394,7 +394,7 @@ async fn userauth(
 //     })
 // }
 
-// Duplex connection forwarding using separate spawned tasks
+// Bidirectional data forwarding using separate tasks but simplified I/O
 fn connect_duplex<A, B>(a: A, b: B)
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -404,72 +404,62 @@ where
     let (a_read, a_write) = a.split();
     let (b_read, b_write) = b.split();
     
-    // Spawn A -> B direction
+    info!("Starting bidirectional data forwarding");
+    
+    // Spawn A -> B direction with immediate data forwarding
     executor::spawn(async move {
-        info!("Starting A->B data forwarding task");
         let mut a_read = a_read;
         let mut b_write = b_write;
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 16384]; // Larger buffer for better throughput
         
+        info!("A->B forwarding task started");
         loop {
             match a_read.read(&mut buf).await {
                 Ok(0) => {
-                    // EOF from A, close B's write side
-                    let _ = b_write.close().await;
-                    info!("A->B direction closed (EOF)");
+                    info!("A->B EOF");
                     break;
                 }
                 Ok(n) => {
                     info!("A->B forwarding {} bytes", n);
-                    if let Err(e) = b_write.write_all(&buf[..n]).await {
-                        error!("A->B write failed: {}", e);
+                    if b_write.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                    if let Err(e) = b_write.flush().await {
-                        error!("A->B flush failed: {}", e);
+                    if b_write.flush().await.is_err() {
                         break;
                     }
                 }
-                Err(e) => {
-                    error!("A->B read failed: {}", e);
-                    break;
-                }
+                Err(_) => break,
             }
         }
+        info!("A->B forwarding task completed");
     });
     
-    // Spawn B -> A direction  
+    // Spawn B -> A direction
     executor::spawn(async move {
-        info!("Starting B->A data forwarding task");
         let mut b_read = b_read;
         let mut a_write = a_write;
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 16384]; // Larger buffer for better throughput
         
+        info!("B->A forwarding task started");
         loop {
             match b_read.read(&mut buf).await {
                 Ok(0) => {
-                    // EOF from B, close A's write side
-                    let _ = a_write.close().await;
-                    info!("B->A direction closed (EOF)");
+                    info!("B->A EOF");
                     break;
                 }
                 Ok(n) => {
                     info!("B->A forwarding {} bytes", n);
-                    if let Err(e) = a_write.write_all(&buf[..n]).await {
-                        error!("B->A write failed: {}", e);
+                    if a_write.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
-                    if let Err(e) = a_write.flush().await {
-                        error!("B->A flush failed: {}", e);
+                    if a_write.flush().await.is_err() {
                         break;
                     }
                 }
-                Err(e) => {
-                    error!("B->A read failed: {}", e);
-                    break;
-                }
+                Err(_) => break,
             }
         }
+        info!("B->A forwarding task completed");
     });
 }
 
