@@ -31,6 +31,10 @@ impl AsyncChannel {
         }
     }
 
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.stream.as_raw_fd()
+    }
+
     // Execute a command
     pub async fn exec(&self, command: &str) -> Result<()> {
         futures::future::poll_fn(|cx| {
@@ -39,12 +43,10 @@ impl AsyncChannel {
             match channel.exec(command) {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
-                    // Schedule to wake up later
-                    let waker = cx.waker().clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        waker.wake();
-                    });
+                    // Register with I/O reactor for socket readiness
+                    let fd = self.stream.as_raw_fd();
+                    crate::executor::io::REACTOR.lock().unwrap()
+                        .set_readable(fd, cx.waker().clone());
                     Poll::Pending
                 }
                 Err(e) => Poll::Ready(Err(e.into())),
@@ -59,7 +61,7 @@ impl AsyncChannel {
         mode: Option<ssh2::PtyModes>,
         dim: Option<(u32, u32, u32, u32)>,
     ) -> Result<()> {
-        let mut channel = self.inner.lock().unwrap();
+        let _channel = self.inner.lock().unwrap();
         
         futures::future::poll_fn(|cx| {
             let mut channel = self.inner.lock().unwrap();
@@ -67,12 +69,10 @@ impl AsyncChannel {
             match channel.request_pty(term, mode.clone(), dim) {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
-                    // Schedule to wake up later
-                    let waker = cx.waker().clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        waker.wake();
-                    });
+                    // Register with I/O reactor for socket readiness
+                    let fd = self.stream.as_raw_fd();
+                    crate::executor::io::REACTOR.lock().unwrap()
+                        .set_readable(fd, cx.waker().clone());
                     Poll::Pending
                 }
                 Err(e) => Poll::Ready(Err(e.into())),
@@ -82,7 +82,7 @@ impl AsyncChannel {
 
     // Start a shell
     pub async fn shell(&self) -> Result<()> {
-        let mut channel = self.inner.lock().unwrap();
+        let _channel = self.inner.lock().unwrap();
         
         futures::future::poll_fn(|cx| {
             let mut channel = self.inner.lock().unwrap();
@@ -90,12 +90,10 @@ impl AsyncChannel {
             match channel.shell() {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
-                    // Schedule to wake up later
-                    let waker = cx.waker().clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        waker.wake();
-                    });
+                    // Register with I/O reactor for socket readiness
+                    let fd = self.stream.as_raw_fd();
+                    crate::executor::io::REACTOR.lock().unwrap()
+                        .set_readable(fd, cx.waker().clone());
                     Poll::Pending
                 }
                 Err(e) => Poll::Ready(Err(e.into())),
@@ -118,12 +116,10 @@ impl AsyncChannel {
                     Poll::Ready(Ok(()))
                 }
                 Err(e) if would_block(&e) => {
-                    // Schedule to wake up later
-                    let waker = cx.waker().clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        waker.wake();
-                    });
+                    // Register with I/O reactor for socket readiness
+                    let fd = self.stream.as_raw_fd();
+                    crate::executor::io::REACTOR.lock().unwrap()
+                        .set_readable(fd, cx.waker().clone());
                     Poll::Pending
                 }
                 Err(e) => Poll::Ready(Err(e.into())),
@@ -140,12 +136,10 @@ impl AsyncChannel {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
                     drop(channel);
-                    // Schedule to wake up later
-                    let waker = cx.waker().clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        waker.wake();
-                    });
+                    // Register with I/O reactor for socket readiness
+                    let fd = self.stream.as_raw_fd();
+                    crate::executor::io::REACTOR.lock().unwrap()
+                        .set_readable(fd, cx.waker().clone());
                     Poll::Pending
                 }
                 Err(e) => Poll::Ready(Err(e.into())),
@@ -161,12 +155,10 @@ impl AsyncChannel {
             match channel.close() {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
-                    // Schedule to wake up later
-                    let waker = cx.waker().clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        waker.wake();
-                    });
+                    // Register with I/O reactor for socket readiness
+                    let fd = self.stream.as_raw_fd();
+                    crate::executor::io::REACTOR.lock().unwrap()
+                        .set_readable(fd, cx.waker().clone());
                     Poll::Pending
                 }
                 Err(e) => Poll::Ready(Err(e.into())),
@@ -183,12 +175,10 @@ impl AsyncChannel {
                 Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
                     drop(channel);
-                    // Schedule to wake up later
-                    let waker = cx.waker().clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        waker.wake();
-                    });
+                    // Register with I/O reactor for socket readiness
+                    let fd = self.stream.as_raw_fd();
+                    crate::executor::io::REACTOR.lock().unwrap()
+                        .set_readable(fd, cx.waker().clone());
                     Poll::Pending
                 }
                 Err(e) => Poll::Ready(Err(e.into())),
@@ -228,12 +218,10 @@ impl AsyncRead for AsyncChannel {
                 Poll::Ready(Ok(n))
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Register with I/O reactor for socket readiness
+                let fd = self.stream.as_raw_fd();
+                crate::executor::io::REACTOR.lock().unwrap()
+                    .set_readable(fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -252,12 +240,10 @@ impl AsyncWrite for AsyncChannel {
         match channel.write(buf) {
             Ok(n) => Poll::Ready(Ok(n)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Register with I/O reactor for socket readiness
+                let fd = self.stream.as_raw_fd();
+                crate::executor::io::REACTOR.lock().unwrap()
+                    .set_readable(fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -273,12 +259,10 @@ impl AsyncWrite for AsyncChannel {
         match channel.flush() {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Register with I/O reactor for socket readiness
+                let fd = self.stream.as_raw_fd();
+                crate::executor::io::REACTOR.lock().unwrap()
+                    .set_readable(fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -298,12 +282,10 @@ impl AsyncWrite for AsyncChannel {
                     self.eof_sent = true;
                 }
                 Err(e) if would_block(&e) => {
-                    // Schedule to wake up later
-                    let waker = cx.waker().clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        waker.wake();
-                    });
+                    // Register with I/O reactor for socket readiness
+                    let fd = self.stream.as_raw_fd();
+                    crate::executor::io::REACTOR.lock().unwrap()
+                        .set_readable(fd, cx.waker().clone());
                     return Poll::Pending;
                 }
                 Err(e) => {
@@ -318,12 +300,10 @@ impl AsyncWrite for AsyncChannel {
         match channel.close() {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if would_block(&e) => {
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Register with I/O reactor for socket readiness
+                let fd = self.stream.as_raw_fd();
+                crate::executor::io::REACTOR.lock().unwrap()
+                    .set_readable(fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => {

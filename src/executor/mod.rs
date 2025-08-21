@@ -1,6 +1,7 @@
 // Minimal single-threaded executor for SSHBind
 // Replaces Tokio with lightweight I/O polling
 
+pub mod io;
 mod reactor;
 mod task;
 mod waker;
@@ -66,6 +67,18 @@ impl Executor {
                 }
             }
 
+            // Add any pending tasks that were spawned
+            let pending_tasks = PENDING_TASKS.with(|pending| {
+                pending.borrow_mut().drain(..).collect::<Vec<_>>()
+            });
+            
+            for task in pending_tasks {
+                let task_id = self.next_task_id;
+                self.next_task_id.0 += 1;
+                let task = Task::new(task_id, task);
+                self.task_queue.push_back(task);
+            }
+
             // If no tasks, we're done
             if self.task_queue.is_empty() {
                 break;
@@ -74,13 +87,20 @@ impl Executor {
             // Poll all ready tasks
             self.poll_tasks()?;
 
+            // Poll the global I/O reactor for ready I/O
+            io::REACTOR.lock().unwrap().poll().ok();
+
             // Poll I/O events with very short timeout for maximum responsiveness
             if !self.task_queue.is_empty() {
                 // Use extremely short timeout for SSH handshake responsiveness
                 let poll_timeout = timeout.map(|t| t.saturating_sub(start_time.elapsed()))
-                    .unwrap_or(Duration::from_micros(100));
+                    .unwrap_or(Duration::from_millis(10));
                 
-                self.reactor.poll_events(poll_timeout)?;
+                // Wait for I/O events
+                io::REACTOR.lock().unwrap().wait(Some(poll_timeout)).ok();
+                
+                // Also poll local reactor for compatibility
+                self.reactor.poll_events(Duration::from_micros(10))?;
             } else {
                 // Even with no tasks, poll briefly to catch new I/O events
                 self.reactor.poll_events(Duration::from_micros(10))?;
@@ -178,6 +198,18 @@ where
             }
         }
         
+        // Add any pending tasks that were spawned during the future
+        let new_pending = PENDING_TASKS.with(|pending| {
+            pending.borrow_mut().drain(..).collect::<Vec<_>>()
+        });
+        
+        for task in new_pending {
+            let task_id = executor.next_task_id;
+            executor.next_task_id.0 += 1;
+            let task = Task::new(task_id, task);
+            executor.task_queue.push_back(task);
+        }
+        
         // Run executor for a short time to process all tasks
         executor.run(Some(Duration::from_millis(10)))?;
         
@@ -193,17 +225,14 @@ where
     }
 }
 
-/// Spawn a future on the global executor instance
+/// Spawn a future on the current executor instance
 pub fn spawn<F>(future: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    // Run the task in a separate thread with its own executor
-    std::thread::spawn(move || {
-        let _ = block_on(async move {
-            future.await;
-            Ok(())
-        });
+    // Add task to pending queue to be executed on current executor
+    PENDING_TASKS.with(|pending| {
+        pending.borrow_mut().push(Box::pin(future));
     });
 }
 
@@ -226,12 +255,13 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    // Run the task in a separate thread
-    std::thread::spawn(move || {
-        let _ = block_on(async move {
-            future.await;
-            Ok(())
+    // Add task to pending queue to be executed on current executor
+    // This is a simplified version - in production you'd want proper task scheduling
+    PENDING_TASKS.with(|pending| {
+        let task = Box::pin(async move {
+            let _ = future.await;
         });
+        pending.borrow_mut().push(task);
     });
     
     JoinHandle::new()

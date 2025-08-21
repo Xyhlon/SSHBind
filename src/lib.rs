@@ -23,6 +23,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
 use futures::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use futures::FutureExt;
 
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -395,62 +396,58 @@ async fn userauth(
 //     })
 // }
 
-// Bidirectional data forwarding using separate tasks but simplified I/O
-fn connect_duplex<A, B>(a: A, b: B) -> executor::JoinHandle<io::Result<()>>
+fn connect_duplex<A, B>(mut a: A, mut b: B) -> executor::JoinHandle<io::Result<()>>
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Split streams and run each direction in its own task
-    let (a_read, a_write) = a.split();
-    let (b_read, b_write) = b.split();
-    
-    // A -> B task
-    executor::spawn(async move {
-        let mut buf = vec![0u8; 16 * 1024];
-        let mut a_read = a_read;
-        let mut b_write = b_write;
-        
-        loop {
-            match a_read.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = b_write.close().await;
-                    break;
-                }
-                Ok(n) => {
-                    if let Err(_) = b_write.write_all(&buf[..n]).await {
-                        break;
+    executor::spawn_handle(async move {
+        let mut buf_a = vec![0u8; 16 * 1024];
+        let mut buf_b = vec![0u8; 16 * 1024];
+
+        // Track whether each *direction* is still open:
+        let mut a_to_b_open = true; // reading A, writing to B
+        let mut b_to_a_open = true; // reading B, writing to A
+
+        // Handling this in that way is kinda sus, however afaik libssh2 channel
+        // need to handle the shutdown of the write side manually.
+        while a_to_b_open || b_to_a_open {
+            // Use futures::select! which is available
+            futures::select! {
+                // A -> B
+                res = a.read(&mut buf_a).fuse() => {
+                    if a_to_b_open {
+                        match res {
+                            Ok(0) => {
+                                // A sent EOF: stop writing to B
+                                a_to_b_open = false;
+                                let _ = b.close().await; // half-close B's write side
+                            }
+                            Ok(n) => b.write_all(&buf_a[..n]).await?,
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
-                Err(_) => break,
-            }
-        }
-    });
-    
-    // B -> A task
-    executor::spawn(async move {
-        let mut buf = vec![0u8; 16 * 1024];
-        let mut b_read = b_read;
-        let mut a_write = a_write;
-        
-        loop {
-            match b_read.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = a_write.close().await;
-                    break;
-                }
-                Ok(n) => {
-                    if let Err(_) = a_write.write_all(&buf[..n]).await {
-                        break;
+
+                // B -> A
+                res = b.read(&mut buf_b).fuse() => {
+                    if b_to_a_open {
+                        match res {
+                            Ok(0) => {
+                                // B sent EOF: stop writing to A
+                                b_to_a_open = false;
+                                let _ = a.close().await; // half-close A's write side
+                            }
+                            Ok(n) => a.write_all(&buf_b[..n]).await?,
+                            Err(e) => return Err(e),
+                        }
                     }
                 }
-                Err(_) => break,
             }
         }
-    });
-    
-    // Return a dummy handle since the tasks are already spawned
-    executor::JoinHandle::new()
+
+        Ok(())
+    })
 }
 
 // fn connect_duplex<A, B>(

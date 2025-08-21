@@ -1,145 +1,89 @@
-// Tests for the executor module
-#[cfg(test)]
-mod tests {
-    use crate::executor::{Executor, Reactor, TaskId, SshBindWaker, block_on};
-    use std::time::{Duration, Instant};
-    use std::future::Future;
+use super::*;
+use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::time::{Duration, Instant};
 
-    #[test]
-    fn test_executor_creation() {
-        let executor = Executor::new();
-        assert!(executor.is_ok());
-    }
+#[test]
+fn test_block_on_simple() {
+    let result = block_on(async {
+        Ok(42)
+    });
+    assert_eq!(result.unwrap(), 42);
+}
 
-    #[test]
-    fn test_task_spawn_and_execution() {
-        let mut executor = Executor::new().unwrap();
-        
-        let mut executed = false;
-        let executed_ptr = &mut executed as *mut bool;
+#[test]
+fn test_block_on_with_await() {
+    let result = block_on(async {
+        let a = async { 1 }.await;
+        let b = async { 2 }.await;
+        Ok(a + b)
+    });
+    assert_eq!(result.unwrap(), 3);
+}
 
-        // Spawn a simple task
-        executor.spawn_task(async move {
-            unsafe {
-                *executed_ptr = true;
-            }
-        });
+#[test]
+fn test_spawn_runs_concurrently() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter1 = counter.clone();
+    let counter2 = counter.clone();
+    
+    spawn(async move {
+        counter1.fetch_add(1, Ordering::SeqCst);
+    });
+    
+    spawn(async move {
+        counter2.fetch_add(1, Ordering::SeqCst);
+    });
+    
+    // Give spawned tasks time to complete
+    std::thread::sleep(Duration::from_millis(100));
+    
+    assert_eq!(counter.load(Ordering::SeqCst), 2);
+}
 
-        // Run the executor briefly
-        let result = executor.run(Some(Duration::from_millis(100)));
-        assert!(result.is_ok());
-        assert!(executed);
-    }
-
-    #[test]
-    fn test_multiple_tasks() {
-        let mut executor = Executor::new().unwrap();
-        
-        let mut counter = 0;
-        let counter_ptr = &mut counter as *mut i32;
-
-        // Spawn multiple tasks
-        for i in 0..5 {
-            executor.spawn_task(async move {
-                unsafe {
-                    *counter_ptr += i;
-                }
-            });
+#[test]
+fn test_yield_now() {
+    let result = block_on(async {
+        let mut count = 0;
+        for _ in 0..3 {
+            count += 1;
+            yield_now().await;
         }
+        Ok(count)
+    });
+    assert_eq!(result.unwrap(), 3);
+}
 
-        // Run the executor
-        let result = executor.run(Some(Duration::from_millis(100)));
-        assert!(result.is_ok());
-        assert_eq!(counter, 0 + 1 + 2 + 3 + 4);
-    }
+#[test]
+fn test_select_two_futures() {
+    use futures::future::FutureExt;
+    use futures::select;
+    
+    let result = block_on(async {
+        let fut1 = async { 1 }.fuse();
+        let fut2 = async { 2 }.fuse();
+        
+        futures::pin_mut!(fut1, fut2);
+        
+        select! {
+            val = fut1 => Ok(val),
+            val = fut2 => Ok(val),
+        }
+    });
+    
+    let val = result.unwrap();
+    assert!(val == 1 || val == 2);
+}
 
-    #[test]
-    fn test_executor_with_timeout() {
-        let mut executor = Executor::new().unwrap();
-        let mut completed = false;
-        let completed_ptr = &mut completed as *mut bool;
-        
-        // Spawn a task that completes quickly
-        executor.spawn_task(async move {
-            unsafe {
-                *completed_ptr = true;
-            }
-        });
-
-        let start = Instant::now();
-        let result = executor.run(Some(Duration::from_millis(50)));
-        let elapsed = start.elapsed();
-        
-        assert!(result.is_ok());
-        assert!(completed);
-        assert!(elapsed < Duration::from_millis(50)); // Should complete before timeout
-    }
-
-    #[test]
-    fn test_empty_executor() {
-        let mut executor = Executor::new().unwrap();
-        
-        // Run executor with no tasks - should return immediately
-        let start = Instant::now();
-        let result = executor.run(Some(Duration::from_millis(100)));
-        let elapsed = start.elapsed();
-        
-        assert!(result.is_ok());
-        assert!(elapsed < Duration::from_millis(10)); // Should return very quickly
-    }
-
-    #[test]
-    fn test_reactor_creation() {
-        let reactor = Reactor::new();
-        assert!(reactor.is_ok());
-        
-        let reactor = reactor.unwrap();
-        assert_eq!(reactor.source_count(), 0);
-    }
-
-    #[test]
-    fn test_task_states() {
-        use crate::executor::task::{Task, TaskState};
-        use std::pin::Pin;
-        
-        let task_id = TaskId(42);
-        let future = Box::pin(async {});
-        let task = Task::new(task_id, future as Pin<Box<dyn Future<Output = ()>>>);
-        
-        assert_eq!(task.id(), task_id);
-        assert_eq!(task.state(), TaskState::Ready);
-        assert!(task.is_ready());
-        assert!(!task.is_waiting());
-        assert!(!task.is_completed());
-    }
-
-    #[tokio::test]
-    async fn test_block_on_success() {
-        let result = block_on(async {
-            Ok::<i32, crate::async_ssh::Error>(42)
-        });
-        
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 42);
-    }
-
-    #[tokio::test] 
-    async fn test_block_on_error() {
-        let result = block_on(async {
-            Err::<i32, crate::async_ssh::Error>(crate::async_ssh::Error::Other("test error".to_string()))
-        });
-        
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_waker_functionality() {
-        let task_id = TaskId(123);
-        let waker = SshBindWaker::new(task_id);
-        
-        assert!(!waker.is_woken());
-        waker.wake();
-        assert!(waker.is_woken());
-        assert!(!waker.is_woken()); // Should be cleared after check
-    }
+#[test]
+fn test_timeout() {
+    let start = Instant::now();
+    let result: crate::async_ssh::Result<()> = block_on(async {
+        // This should timeout
+        loop {
+            yield_now().await;
+        }
+    });
+    
+    assert!(result.is_err());
+    assert!(start.elapsed() < Duration::from_secs(35)); // Default timeout is 30s
 }

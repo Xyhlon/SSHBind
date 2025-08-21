@@ -4,7 +4,6 @@ use std::sync::{Arc, Mutex};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::io;
 
 use ssh2::{Session, KeyboardInteractivePrompt};
 
@@ -218,12 +217,10 @@ impl Future for HandshakeFuture {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if would_block(&e) => {
                 drop(session);
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Register with I/O reactor for socket readiness
+                let fd = self.stream.as_raw_fd();
+                crate::executor::io::REACTOR.lock().unwrap()
+                    .set_readable(fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e.into())),
@@ -250,12 +247,10 @@ impl Future for UserAuthPasswordFuture {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if would_block(&e) => {
                 drop(session);
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Register with I/O reactor for socket readiness
+                let fd = self.stream.as_raw_fd();
+                crate::executor::io::REACTOR.lock().unwrap()
+                    .set_readable(fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e.into())),
@@ -288,12 +283,10 @@ impl Future for UserAuthPubkeyFileFuture {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if would_block(&e) => {
                 drop(session);
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Register with I/O reactor for socket readiness
+                let fd = self.stream.as_raw_fd();
+                crate::executor::io::REACTOR.lock().unwrap()
+                    .set_readable(fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e.into())),
@@ -317,12 +310,10 @@ impl Future for ChannelSessionFuture {
             Ok(channel) => Poll::Ready(Ok(channel)),
             Err(e) if would_block(&e) => {
                 drop(session);
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Register with I/O reactor for socket readiness
+                let fd = self.stream.as_raw_fd();
+                crate::executor::io::REACTOR.lock().unwrap()
+                    .set_readable(fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e.into())),
@@ -350,12 +341,10 @@ impl Future for ChannelDirectTcpipFuture {
             Ok(channel) => Poll::Ready(Ok(channel)),
             Err(e) if would_block(&e) => {
                 drop(session);
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Register with I/O reactor for socket readiness
+                let fd = self.stream.as_raw_fd();
+                crate::executor::io::REACTOR.lock().unwrap()
+                    .set_readable(fd, cx.waker().clone());
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e.into())),
