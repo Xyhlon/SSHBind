@@ -1,3 +1,6 @@
+// Custom async SSH wrapper module - replacement for async-ssh2-lite
+pub mod async_ssh;
+
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::error::Error;
