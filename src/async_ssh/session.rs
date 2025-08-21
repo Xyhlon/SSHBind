@@ -26,13 +26,13 @@ impl Default for SessionConfiguration {
 }
 
 // Async wrapper around ssh2::Session
-pub struct AsyncSession<S = AsyncTcpStream> {
+pub struct AsyncSession {
     inner: Arc<Mutex<Session>>,
-    stream: Arc<S>,
+    stream: Arc<AsyncTcpStream>,
     config: SessionConfiguration,
 }
 
-impl AsyncSession<AsyncTcpStream> {
+impl AsyncSession {
     // Connect to an SSH server
     pub async fn connect(
         addr: SocketAddr, 
@@ -62,9 +62,9 @@ impl AsyncSession<AsyncTcpStream> {
     }
 }
 
-impl<S> AsyncSession<S> {
+impl AsyncSession {
     // Create from existing session and stream
-    pub fn from_parts(session: Session, stream: S, config: SessionConfiguration) -> Self {
+    pub fn from_parts(session: Session, stream: AsyncTcpStream, config: SessionConfiguration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(session)),
             stream: Arc::new(stream),
@@ -147,12 +147,12 @@ impl<S> AsyncSession<S> {
     // Create a session channel
     pub async fn channel_session(&self) -> Result<AsyncChannel> {
         let session = self.inner.clone();
-        let _stream = self.stream.clone();
+        let stream = self.stream.clone();
         
         ChannelSessionFuture {
             session: session.clone(),
         }.await.map(|channel| {
-            AsyncChannel::new(channel, session, Arc::new(()))
+            AsyncChannel::new(channel, session, stream)
         })
     }
 
@@ -167,7 +167,7 @@ impl<S> AsyncSession<S> {
         let host = host.to_string();
         let src_host = src_host.map(|s| s.to_string()).unwrap_or_else(|| "127.0.0.1".to_string());
         let session = self.inner.clone();
-        let _stream = self.stream.clone();
+        let stream = self.stream.clone();
         
         ChannelDirectTcpipFuture {
             session: session.clone(),
@@ -176,7 +176,7 @@ impl<S> AsyncSession<S> {
             src_host,
             src_port,
         }.await.map(|channel| {
-            AsyncChannel::new(channel, session, Arc::new(()))
+            AsyncChannel::new(channel, session, stream)
         })
     }
 

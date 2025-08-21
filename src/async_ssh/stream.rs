@@ -10,7 +10,7 @@ use futures::io::{AsyncRead, AsyncWrite};
 
 // Global reactor for I/O polling
 lazy_static::lazy_static! {
-    static ref REACTOR: Reactor = Reactor::new();
+    pub(crate) static ref REACTOR: Reactor = Reactor::new();
 }
 
 struct Reactor {
@@ -59,7 +59,7 @@ impl Reactor {
         Ok(())
     }
 
-    fn poll_ready(&self, key: usize, cx: &mut Context<'_>, readable: bool) 
+    pub(crate) fn poll_ready(&self, key: usize, cx: &mut Context<'_>, readable: bool) 
         -> Poll<io::Result<()>> 
     {
         let mut sources = self.sources.lock().unwrap();
@@ -134,15 +134,27 @@ impl Reactor {
 // Async wrapper around std::net::TcpStream
 pub struct AsyncTcpStream {
     inner: Arc<TcpStream>,
-    key: usize,
+    pub(crate) key: usize,
 }
 
 impl AsyncTcpStream {
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
-        // Use blocking connect for now, can be made async later
-        let stream = TcpStream::connect(addr)?;
-        stream.set_nonblocking(true)?;
+        // Use a timeout-based approach that's better than blocking
+        // This connects with a small timeout and retries if needed
+        let stream = loop {
+            match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(10)) {
+                Ok(stream) => break stream,
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    // Yield to executor and try again
+                    futures::future::ready(()).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        };
         
+        // Set to non-blocking for future operations
+        stream.set_nonblocking(true)?;
         let key = REACTOR.register(&stream)?;
         
         Ok(Self {

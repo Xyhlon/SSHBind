@@ -6,10 +6,12 @@ use std::task::{Context, Poll};
 use futures::io::{AsyncRead, AsyncWrite};
 
 use crate::async_ssh::Result;
+use crate::async_ssh::stream::{AsyncTcpStream, REACTOR};
 
 // Async wrapper around ssh2::Channel
 pub struct AsyncChannel {
     inner: Arc<Mutex<ssh2::Channel>>,
+    stream: Arc<AsyncTcpStream>,
     eof_sent: bool,
 }
 
@@ -17,31 +19,35 @@ impl AsyncChannel {
     pub(crate) fn new(
         channel: ssh2::Channel,
         _session: Arc<Mutex<ssh2::Session>>,
-        _stream: Arc<()>,
+        stream: Arc<AsyncTcpStream>,
     ) -> Self {
         // SSH2 channels inherit non-blocking from session
         // No need to set explicitly
         
         Self {
             inner: Arc::new(Mutex::new(channel)),
+            stream,
             eof_sent: false,
         }
     }
 
     // Execute a command
     pub async fn exec(&self, command: &str) -> Result<()> {
-        let mut channel = self.inner.lock().unwrap();
-        
-        loop {
+        futures::future::poll_fn(|cx| {
+            let mut channel = self.inner.lock().unwrap();
+            
             match channel.exec(command) {
-                Ok(()) => return Ok(()),
+                Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
-                    // Need to wait for I/O - yield to allow other tasks to run  
-                    std::thread::yield_now();
+                    // Wait for socket to be ready for write
+                    match REACTOR.poll_ready(self.stream.key, cx, false) {
+                        Poll::Ready(_) => Poll::Pending, // Try again next poll
+                        Poll::Pending => Poll::Pending,
+                    }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => Poll::Ready(Err(e.into())),
             }
-        }
+        }).await
     }
 
     // Request a PTY
@@ -53,32 +59,42 @@ impl AsyncChannel {
     ) -> Result<()> {
         let mut channel = self.inner.lock().unwrap();
         
-        loop {
+        futures::future::poll_fn(|cx| {
+            let mut channel = self.inner.lock().unwrap();
+            
             match channel.request_pty(term, mode.clone(), dim) {
-                Ok(()) => return Ok(()),
+                Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
-                    // Yield control to allow other tasks to run
-                    std::thread::yield_now();
+                    // Wait for socket to be ready for write
+                    match REACTOR.poll_ready(self.stream.key, cx, false) {
+                        Poll::Ready(_) => Poll::Pending, // Try again next poll
+                        Poll::Pending => Poll::Pending,
+                    }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => Poll::Ready(Err(e.into())),
             }
-        }
+        }).await
     }
 
     // Start a shell
     pub async fn shell(&self) -> Result<()> {
         let mut channel = self.inner.lock().unwrap();
         
-        loop {
+        futures::future::poll_fn(|cx| {
+            let mut channel = self.inner.lock().unwrap();
+            
             match channel.shell() {
-                Ok(()) => return Ok(()),
+                Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
-                    // Yield control to allow other tasks to run
-                    std::thread::yield_now();
+                    // Wait for socket to be ready for write
+                    match REACTOR.poll_ready(self.stream.key, cx, false) {
+                        Poll::Ready(_) => Poll::Pending, // Try again next poll
+                        Poll::Pending => Poll::Pending,
+                    }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => Poll::Ready(Err(e.into())),
             }
-        }
+        }).await
     }
 
     // Send EOF
@@ -87,71 +103,83 @@ impl AsyncChannel {
             return Ok(());
         }
         
-        let mut channel = self.inner.lock().unwrap();
-        
-        loop {
+        futures::future::poll_fn(|cx| {
+            let mut channel = self.inner.lock().unwrap();
+            
             match channel.send_eof() {
                 Ok(()) => {
                     self.eof_sent = true;
-                    return Ok(());
+                    Poll::Ready(Ok(()))
                 }
                 Err(e) if would_block(&e) => {
-                    // Yield control to allow other tasks to run
-                    std::thread::yield_now();
+                    // Wait for socket to be ready for write
+                    match REACTOR.poll_ready(self.stream.key, cx, false) {
+                        Poll::Ready(_) => Poll::Pending, // Try again next poll
+                        Poll::Pending => Poll::Pending,
+                    }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => Poll::Ready(Err(e.into())),
             }
-        }
+        }).await
     }
 
     // Wait for EOF
     pub async fn wait_eof(&self) -> Result<()> {
-        loop {
+        futures::future::poll_fn(|cx| {
             let mut channel = self.inner.lock().unwrap();
             
             match channel.wait_eof() {
-                Ok(()) => return Ok(()),
+                Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
                     drop(channel);
-                    // Yield control to allow other tasks to run
-                    std::thread::yield_now();
+                    // Wait for socket to be ready for read
+                    match REACTOR.poll_ready(self.stream.key, cx, true) {
+                        Poll::Ready(_) => Poll::Pending, // Try again next poll
+                        Poll::Pending => Poll::Pending,
+                    }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => Poll::Ready(Err(e.into())),
             }
-        }
+        }).await
     }
 
     // Close the channel
     pub async fn close(&self) -> Result<()> {
-        let mut channel = self.inner.lock().unwrap();
-        
-        loop {
+        futures::future::poll_fn(|cx| {
+            let mut channel = self.inner.lock().unwrap();
+            
             match channel.close() {
-                Ok(()) => return Ok(()),
+                Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
-                    // Yield control to allow other tasks to run
-                    std::thread::yield_now();
+                    // Wait for socket to be ready for write
+                    match REACTOR.poll_ready(self.stream.key, cx, false) {
+                        Poll::Ready(_) => Poll::Pending, // Try again next poll
+                        Poll::Pending => Poll::Pending,
+                    }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => Poll::Ready(Err(e.into())),
             }
-        }
+        }).await
     }
 
     // Wait for the channel to close
     pub async fn wait_close(&self) -> Result<()> {
-        loop {
+        futures::future::poll_fn(|cx| {
             let mut channel = self.inner.lock().unwrap();
             
             match channel.wait_close() {
-                Ok(()) => return Ok(()),
+                Ok(()) => Poll::Ready(Ok(())),
                 Err(e) if would_block(&e) => {
                     drop(channel);
-                    // Yield control to allow other tasks to run
-                    std::thread::yield_now();
+                    // Wait for socket to be ready for read
+                    match REACTOR.poll_ready(self.stream.key, cx, true) {
+                        Poll::Ready(_) => Poll::Pending, // Try again next poll
+                        Poll::Pending => Poll::Pending,
+                    }
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => Poll::Ready(Err(e.into())),
             }
-        }
+        }).await
     }
 
     // Get exit status
@@ -186,9 +214,9 @@ impl AsyncRead for AsyncChannel {
                 Poll::Ready(Ok(n))
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Need to wait for data
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                // Need to wait for socket to be ready for reading
+                REACTOR.poll_ready(self.stream.key, cx, true)
+                    .map(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)))
             }
             Err(e) => Poll::Ready(Err(e)),
         }
@@ -206,8 +234,9 @@ impl AsyncWrite for AsyncChannel {
         match channel.write(buf) {
             Ok(n) => Poll::Ready(Ok(n)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                // Need to wait for socket to be ready for writing
+                REACTOR.poll_ready(self.stream.key, cx, false)
+                    .map(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)))
             }
             Err(e) => Poll::Ready(Err(e)),
         }
@@ -222,8 +251,9 @@ impl AsyncWrite for AsyncChannel {
         match channel.flush() {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                // Need to wait for socket to be ready for writing
+                REACTOR.poll_ready(self.stream.key, cx, false)
+                    .map(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)))
             }
             Err(e) => Poll::Ready(Err(e)),
         }
@@ -242,8 +272,9 @@ impl AsyncWrite for AsyncChannel {
                     self.eof_sent = true;
                 }
                 Err(e) if would_block(&e) => {
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
+                    // Need to wait for socket to be ready for writing
+                    return REACTOR.poll_ready(self.stream.key, cx, false)
+                        .map(|_| Err(io::Error::new(io::ErrorKind::WouldBlock, "send_eof would block")));
                 }
                 Err(e) => {
                     // Convert ssh2::Error to io::Error
@@ -257,8 +288,9 @@ impl AsyncWrite for AsyncChannel {
         match channel.close() {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if would_block(&e) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                // Need to wait for socket to be ready for writing
+                REACTOR.poll_ready(self.stream.key, cx, false)
+                    .map(|_| Err(io::Error::new(io::ErrorKind::WouldBlock, "close would block")))
             }
             Err(e) => {
                 // Convert ssh2::Error to io::Error
