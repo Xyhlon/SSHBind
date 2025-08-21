@@ -125,6 +125,9 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
     });
     info!("Service started");
 
+    // Give servers time to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
     bind(
         bind_addr,
         jump_hosts,
@@ -234,6 +237,9 @@ async fn serial_integration_test_correct_configuration_multiple(
             socket.write_all(b"hello world!").await.unwrap();
         }
     });
+
+    // Give servers time to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     bind(
         bind_addr,
@@ -352,6 +358,9 @@ async fn serial_integration_test_second_server_wrong_credentials(
         }
     });
 
+    // Give servers time to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
     bind(
         bind_addr,
         jump_hosts,
@@ -446,6 +455,9 @@ async fn serial_integration_test_correct_configuration_2fa(
             socket.write_all(b"hello world!").await.unwrap();
         }
     });
+
+    // Give servers time to start
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     bind(
         bind_addr,
