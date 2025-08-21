@@ -215,8 +215,14 @@ impl AsyncRead for AsyncChannel {
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // Need to wait for socket to be ready for reading
-                REACTOR.poll_ready(self.stream.key, cx, true)
-                    .map(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)))
+                match REACTOR.poll_ready(self.stream.key, cx, true) {
+                    Poll::Ready(_) => {
+                        // Socket is ready, but we already tried reading and got WouldBlock
+                        // Return Pending to try again on next poll
+                        Poll::Pending
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
             }
             Err(e) => Poll::Ready(Err(e)),
         }
@@ -235,8 +241,14 @@ impl AsyncWrite for AsyncChannel {
             Ok(n) => Poll::Ready(Ok(n)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // Need to wait for socket to be ready for writing
-                REACTOR.poll_ready(self.stream.key, cx, false)
-                    .map(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)))
+                match REACTOR.poll_ready(self.stream.key, cx, false) {
+                    Poll::Ready(_) => {
+                        // Socket is ready, but we already tried writing and got WouldBlock
+                        // Return Pending to try again on next poll
+                        Poll::Pending
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
             }
             Err(e) => Poll::Ready(Err(e)),
         }
@@ -252,8 +264,14 @@ impl AsyncWrite for AsyncChannel {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // Need to wait for socket to be ready for writing
-                REACTOR.poll_ready(self.stream.key, cx, false)
-                    .map(|_| Err(io::Error::from(io::ErrorKind::WouldBlock)))
+                match REACTOR.poll_ready(self.stream.key, cx, false) {
+                    Poll::Ready(_) => {
+                        // Socket is ready, but we already tried flushing and got WouldBlock
+                        // Return Pending to try again on next poll
+                        Poll::Pending
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
             }
             Err(e) => Poll::Ready(Err(e)),
         }
@@ -273,8 +291,10 @@ impl AsyncWrite for AsyncChannel {
                 }
                 Err(e) if would_block(&e) => {
                     // Need to wait for socket to be ready for writing
-                    return REACTOR.poll_ready(self.stream.key, cx, false)
-                        .map(|_| Err(io::Error::new(io::ErrorKind::WouldBlock, "send_eof would block")));
+                    return match REACTOR.poll_ready(self.stream.key, cx, false) {
+                        Poll::Ready(_) => Poll::Pending, // Try again on next poll
+                        Poll::Pending => Poll::Pending,
+                    };
                 }
                 Err(e) => {
                     // Convert ssh2::Error to io::Error
@@ -289,8 +309,10 @@ impl AsyncWrite for AsyncChannel {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if would_block(&e) => {
                 // Need to wait for socket to be ready for writing
-                REACTOR.poll_ready(self.stream.key, cx, false)
-                    .map(|_| Err(io::Error::new(io::ErrorKind::WouldBlock, "close would block")))
+                match REACTOR.poll_ready(self.stream.key, cx, false) {
+                    Poll::Ready(_) => Poll::Pending, // Try again on next poll
+                    Poll::Pending => Poll::Pending,
+                }
             }
             Err(e) => {
                 // Convert ssh2::Error to io::Error
