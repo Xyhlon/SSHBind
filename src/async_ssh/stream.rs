@@ -1,46 +1,47 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use futures::io::{AsyncRead, AsyncWrite};
+use polling::{Event, Events, Poller};
 
-// Async wrapper around std::net::TcpStream
+// Async wrapper around std::net::TcpStream with proper polling
 pub struct AsyncTcpStream {
     inner: Arc<TcpStream>,
+    poller: Arc<Poller>,
 }
 
 impl AsyncTcpStream {
     pub async fn connect(addr: SocketAddr) -> io::Result<Self> {
-        // Use a timeout-based approach that's better than blocking
-        // This connects with a small timeout and retries if needed
-        let stream = loop {
-            match TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(10)) {
-                Ok(stream) => break stream,
-                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                    // Yield to executor and try again
-                    futures::future::ready(()).await;
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        };
-        
-        // Set to non-blocking for future operations
+        // Connect with non-blocking I/O
+        let stream = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10))?;
         stream.set_nonblocking(true)?;
+        
+        let poller = Poller::new()?;
+        unsafe {
+            poller.add(&stream, Event::all(0))?;
+        }
         
         Ok(Self {
             inner: Arc::new(stream),
+            poller: Arc::new(poller),
         })
     }
 
     pub fn from_std(stream: TcpStream) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
         
+        let poller = Poller::new()?;
+        unsafe {
+            poller.add(&stream, Event::all(0))?;
+        }
+        
         Ok(Self {
             inner: Arc::new(stream),
+            poller: Arc::new(poller),
         })
     }
 
@@ -61,16 +62,31 @@ impl AsyncRead for AsyncTcpStream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        // Try to read directly
+        // Try to read
         match (&*self.inner).read(buf) {
             Ok(n) => Poll::Ready(Ok(n)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Poll for readability
+                let mut events = Events::new();
+                match self.poller.wait(&mut events, Some(std::time::Duration::ZERO)) {
+                    Ok(_) => {
+                        // Check if our socket is readable
+                        for ev in events.iter() {
+                            if ev.readable {
+                                // Try reading again
+                                match (&*self.inner).read(buf) {
+                                    Ok(n) => return Poll::Ready(Ok(n)),
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                                    Err(e) => return Poll::Ready(Err(e)),
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+                
+                // Not ready, register waker for next poll
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -84,16 +100,31 @@ impl AsyncWrite for AsyncTcpStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        // Try to write directly
+        // Try to write
         match (&*self.inner).write(buf) {
             Ok(n) => Poll::Ready(Ok(n)),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(1));
-                    waker.wake();
-                });
+                // Poll for writability
+                let mut events = Events::new();
+                match self.poller.wait(&mut events, Some(std::time::Duration::ZERO)) {
+                    Ok(_) => {
+                        // Check if our socket is writable
+                        for ev in events.iter() {
+                            if ev.writable {
+                                // Try writing again
+                                match (&*self.inner).write(buf) {
+                                    Ok(n) => return Poll::Ready(Ok(n)),
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                                    Err(e) => return Poll::Ready(Err(e)),
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+                
+                // Not ready, register waker for next poll
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),
@@ -104,16 +135,10 @@ impl AsyncWrite for AsyncTcpStream {
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
-        // Try to flush directly
         match (&*self.inner).flush() {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                // Schedule to wake up later
-                let waker = cx.waker().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(1));
-                    waker.wake();
-                });
+                cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Err(e) => Poll::Ready(Err(e)),

@@ -196,12 +196,45 @@ where
 /// Spawn a future on the global executor instance
 pub fn spawn<F>(future: F)
 where
-    F: Future<Output = ()> + 'static,
+    F: Future<Output = ()> + Send + 'static,
 {
-    // Always store in pending tasks - block_on will pick them up
-    PENDING_TASKS.with(|tasks| {
-        tasks.borrow_mut().push(Box::pin(future));
+    // Run the task in a separate thread with its own executor
+    std::thread::spawn(move || {
+        let _ = block_on(async move {
+            future.await;
+            Ok(())
+        });
     });
+}
+
+/// JoinHandle for spawned tasks (mimics tokio::task::JoinHandle)
+pub struct JoinHandle<T> {
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<T> JoinHandle<T> {
+    pub fn new() -> Self {
+        Self {
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Spawn a future and return a JoinHandle
+pub fn spawn_handle<F, T>(future: F) -> JoinHandle<T>
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    // Run the task in a separate thread
+    std::thread::spawn(move || {
+        let _ = block_on(async move {
+            future.await;
+            Ok(())
+        });
+    });
+    
+    JoinHandle::new()
 }
 
 // Thread-local storage for tasks spawned before executor starts
