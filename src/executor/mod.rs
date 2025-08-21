@@ -74,10 +74,12 @@ impl Executor {
             // Poll all ready tasks
             self.poll_tasks()?;
 
-            // Poll I/O events with very short timeout to keep executor responsive
+            // Wait for I/O events if we have pending tasks
             if !self.task_queue.is_empty() {
-                // Use very short timeout to keep executor responsive for SSH handshakes
-                self.reactor.poll_events(Duration::from_micros(100))?;
+                let poll_timeout = timeout.map(|t| t.saturating_sub(start_time.elapsed()))
+                    .unwrap_or(Duration::from_millis(10));
+                
+                self.reactor.poll_events(poll_timeout)?;
             }
         }
 
@@ -87,7 +89,7 @@ impl Executor {
     fn poll_tasks(&mut self) -> Result<()> {
         let mut tasks_to_repoll = Vec::new();
         
-        // For debugging: always poll all tasks for now
+        // Poll each task once
         while let Some(mut task) = self.task_queue.pop_front() {
             let ssh_waker = SshBindWaker::new(task.id());
             let waker = ssh_waker.into_std_waker();
@@ -98,7 +100,7 @@ impl Executor {
                     // Task completed, don't re-queue
                 }
                 std::task::Poll::Pending => {
-                    // Task is waiting for I/O, re-queue for later
+                    // Task is waiting, re-queue for later
                     tasks_to_repoll.push(task);
                 }
             }
@@ -153,8 +155,30 @@ where
         }
     });
 
-    // Run until completion or timeout (30 seconds for SSH operations)
-    executor.run(Some(Duration::from_secs(30)))?;
+    // Run until the main future completes OR timeout
+    let start_time = std::time::Instant::now();
+    let timeout_duration = Duration::from_secs(30);
+    
+    loop {
+        // Check timeout
+        if start_time.elapsed() >= timeout_duration {
+            break;
+        }
+        
+        // Check if main future completed
+        {
+            let result_guard = result.lock().unwrap();
+            if result_guard.is_some() {
+                break;
+            }
+        }
+        
+        // Run executor for a short time to process all tasks
+        executor.run(Some(Duration::from_millis(10)))?;
+        
+        // Small delay to prevent busy waiting
+        std::thread::sleep(Duration::from_millis(1));
+    }
 
     // Extract result
     let mut result_guard = result.lock().unwrap();
