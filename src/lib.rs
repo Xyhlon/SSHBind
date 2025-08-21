@@ -419,6 +419,7 @@ where
                     break;
                 }
                 Ok(n) => {
+                    info!("A->B forwarding {} bytes", n);
                     if let Err(e) = b_write.write_all(&buf[..n]).await {
                         error!("A->B write failed: {}", e);
                         break;
@@ -451,6 +452,7 @@ where
                     break;
                 }
                 Ok(n) => {
+                    info!("B->A forwarding {} bytes", n);
                     if let Err(e) = a_write.write_all(&buf[..n]).await {
                         error!("B->A write failed: {}", e);
                         break;
