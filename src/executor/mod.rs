@@ -74,12 +74,16 @@ impl Executor {
             // Poll all ready tasks
             self.poll_tasks()?;
 
-            // Wait for I/O events if we have pending tasks
+            // Poll I/O events with very short timeout for maximum responsiveness
             if !self.task_queue.is_empty() {
+                // Use extremely short timeout for SSH handshake responsiveness
                 let poll_timeout = timeout.map(|t| t.saturating_sub(start_time.elapsed()))
-                    .unwrap_or(Duration::from_millis(10));
+                    .unwrap_or(Duration::from_micros(100));
                 
                 self.reactor.poll_events(poll_timeout)?;
+            } else {
+                // Even with no tasks, poll briefly to catch new I/O events
+                self.reactor.poll_events(Duration::from_micros(10))?;
             }
         }
 
@@ -119,6 +123,7 @@ impl Executor {
         &self.reactor
     }
 }
+
 
 /// Block on a future until it completes  
 pub fn block_on<F, T: 'static>(future: F) -> Result<T>
@@ -232,4 +237,13 @@ impl Future for YieldNow {
 /// Yield execution to allow other tasks to run
 pub fn yield_now() -> YieldNow {
     YieldNow { yielded: false }
+}
+
+/// Force the executor to process any spawned tasks immediately
+pub fn yield_executor() {
+    // Don't drain tasks, just run a quick executor cycle to let spawned tasks start
+    if let Ok(mut executor) = Executor::new() {
+        // Run briefly to process any I/O events and wake up tasks
+        let _ = executor.run(Some(Duration::from_millis(5)));
+    }
 }

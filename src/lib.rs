@@ -666,12 +666,17 @@ async fn connect_chain(
         let client_conn = AsyncTcpStream::from_std(client_stream)?;
         let server_conn = AsyncTcpStream::from_std(server_stream)?;
         
-        // Start data forwarding between server connection and SSH channel
-        connect_duplex(server_conn, channel);
-
         let ssh_session = ssh2::Session::new()?;
         session = AsyncSession::from_parts(ssh_session, client_conn, SessionConfiguration::default())?;
+        
         info!("Starting SSH handshake for jump host {}", i);
+        
+        // Start async data forwarding in background
+        connect_duplex(server_conn, channel);
+        
+        // Critical: Give time for data forwarding to establish before handshake
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        
         session.handshake().await?;
         info!("SSH handshake completed for jump host {}", i);
         userauth(&session, creds_map, &jump_hosts[i]).await?;
