@@ -45,4 +45,10 @@ impl From<io::Error> for Error {
     }
 }
 
+impl From<String> for Error {
+    fn from(s: String) -> Self {
+        Error::Other(s)
+    }
+}
+
 pub type Result<T> = std::result::Result<T, Error>;
