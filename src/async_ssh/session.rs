@@ -116,7 +116,7 @@ impl<S> AsyncSession<S> {
         P: KeyboardInteractivePrompt,
     {
         // SSH2 keyboard-interactive is synchronous, so we wrap it
-        let mut session = self.inner.lock().unwrap();
+        let session = self.inner.lock().unwrap();
         session.userauth_keyboard_interactive(username, prompter)?;
         Ok(())
     }
@@ -145,14 +145,14 @@ impl<S> AsyncSession<S> {
     }
 
     // Create a session channel
-    pub async fn channel_session(&self) -> Result<AsyncChannel<S>> {
+    pub async fn channel_session(&self) -> Result<AsyncChannel> {
         let session = self.inner.clone();
-        let stream = self.stream.clone();
+        let _stream = self.stream.clone();
         
         ChannelSessionFuture {
             session: session.clone(),
         }.await.map(|channel| {
-            AsyncChannel::new(channel, session, stream)
+            AsyncChannel::new(channel, session, Arc::new(()))
         })
     }
 
@@ -163,11 +163,11 @@ impl<S> AsyncSession<S> {
         port: u16,
         src_host: Option<&str>,
         src_port: u16,
-    ) -> Result<AsyncChannel<S>> {
+    ) -> Result<AsyncChannel> {
         let host = host.to_string();
         let src_host = src_host.map(|s| s.to_string()).unwrap_or_else(|| "127.0.0.1".to_string());
         let session = self.inner.clone();
-        let stream = self.stream.clone();
+        let _stream = self.stream.clone();
         
         ChannelDirectTcpipFuture {
             session: session.clone(),
@@ -176,7 +176,7 @@ impl<S> AsyncSession<S> {
             src_host,
             src_port,
         }.await.map(|channel| {
-            AsyncChannel::new(channel, session, stream)
+            AsyncChannel::new(channel, session, Arc::new(()))
         })
     }
 
@@ -187,7 +187,7 @@ impl<S> AsyncSession<S> {
         description: &str,
         lang: Option<&str>,
     ) -> Result<()> {
-        let mut session = self.inner.lock().unwrap();
+        let session = self.inner.lock().unwrap();
         session.disconnect(reason, description, lang)?;
         Ok(())
     }
@@ -227,7 +227,7 @@ impl Future for UserAuthPasswordFuture {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut session = self.session.lock().unwrap();
+        let session = self.session.lock().unwrap();
         
         match session.userauth_password(&self.username, &self.password) {
             Ok(()) => Poll::Ready(Ok(())),
@@ -253,7 +253,7 @@ impl Future for UserAuthPubkeyFileFuture {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut session = self.session.lock().unwrap();
+        let session = self.session.lock().unwrap();
         
         match session.userauth_pubkey_file(
             &self.username,
@@ -280,7 +280,7 @@ impl Future for ChannelSessionFuture {
     type Output = Result<ssh2::Channel>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut session = self.session.lock().unwrap();
+        let session = self.session.lock().unwrap();
         
         match session.channel_session() {
             Ok(channel) => Poll::Ready(Ok(channel)),
@@ -306,7 +306,7 @@ impl Future for ChannelDirectTcpipFuture {
     type Output = Result<ssh2::Channel>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut session = self.session.lock().unwrap();
+        let session = self.session.lock().unwrap();
         
         match session.channel_direct_tcpip(&self.host, self.port, Some((&self.src_host, self.src_port))) {
             Ok(channel) => Poll::Ready(Ok(channel)),

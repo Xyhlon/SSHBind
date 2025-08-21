@@ -28,19 +28,9 @@ impl Interest {
     pub const WRITABLE: Self = Self { readable: false, writable: true };
     pub const BOTH: Self = Self { readable: true, writable: true };
 
-    fn to_polling_key(&self) -> usize {
-        let mut key = 0;
-        if self.readable {
-            key |= polling::Event::readable(0).key;
-        }
-        if self.writable {
-            key |= polling::Event::writable(0).key;
-        }
-        key
-    }
 }
 
-/// Registered I/O source
+/// Registered I/O source  
 pub struct IoSource {
     pub token: Token,
     pub interest: Interest,

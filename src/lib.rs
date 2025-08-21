@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
+use futures::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -419,7 +419,7 @@ where
                     Ok(0) => {
                         // A sent EOF: stop writing to B
                         a_to_b_open = false;
-                        let _ = b.shutdown().await; // half-close B's write side
+                        let _ = AsyncWriteExt::close(&mut b).await; // half-close B's write side
                         progress = true;
                     }
                     Ok(n) => {
@@ -445,7 +445,7 @@ where
                     Ok(0) => {
                         // B sent EOF: stop writing to A
                         b_to_a_open = false;
-                        let _ = a.shutdown().await; // half-close A's write side
+                        let _ = AsyncWriteExt::close(&mut a).await; // half-close A's write side
                         progress = true;
                     }
                     Ok(n) => {
@@ -512,7 +512,7 @@ where
 //                         Ok(0) => {
 //                             // B sent EOF: stop writing to A
 //                             b_to_a_open = false;
-//                             let _ = a.shutdown().await; // half-close A's write side
+//                             let _ = AsyncWriteExt::close(&mut a).await; // half-close A's write side
 //                         }
 //                         Ok(n) => a.write_all(&buf_b[..n]).await?,
 //                         Err(e) => return Err(e),
@@ -810,7 +810,7 @@ async fn run_server(
                             // then assume since no remote_addr is provided
                             // that communication is done over via stdio over
                             // the channel.
-                            let mut channel = session.channel_session().await?;
+                            let channel = session.channel_session().await?;
                             info!("SSH channel established ");
                             channel.exec(cmd).await?;
                             connect_duplex(inbound, channel);

@@ -6,7 +6,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use polling::{Event, Events, Poller};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use futures::io::{AsyncRead, AsyncWrite};
 
 // Global reactor for I/O polling
 lazy_static::lazy_static! {
@@ -53,9 +53,7 @@ impl Reactor {
     }
 
     fn deregister(&self, stream: &TcpStream, key: usize) -> io::Result<()> {
-        unsafe {
-            self.poller.delete(stream)?;
-        }
+        self.poller.delete(stream)?;
         let mut sources = self.sources.lock().unwrap();
         sources.remove(key);
         Ok(())
@@ -183,17 +181,15 @@ impl AsyncRead for AsyncTcpStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         // Wait for readability
         match REACTOR.poll_ready(self.key, cx, true) {
             Poll::Ready(Ok(())) => {
                 // Try to read
-                let mut temp = vec![0u8; buf.remaining()];
-                match (&*self.inner).read(&mut temp) {
+                match (&*self.inner).read(buf) {
                     Ok(n) => {
-                        buf.put_slice(&temp[..n]);
-                        Poll::Ready(Ok(()))
+                        Poll::Ready(Ok(n))
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         REACTOR.clear_readiness(self.key, true);
@@ -253,7 +249,7 @@ impl AsyncWrite for AsyncTcpStream {
         }
     }
 
-    fn poll_shutdown(
+    fn poll_close(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {

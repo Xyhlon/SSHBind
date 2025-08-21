@@ -104,77 +104,6 @@ unsafe fn waker_drop(data: *const ()) {
     drop(Box::from_raw(data as *mut SshBindWaker));
 }
 
-/// Waker registry for managing task wakers globally
-pub struct WakerRegistry {
-    wakers: Mutex<HashMap<TaskId, SshBindWaker>>,
-}
-
-impl WakerRegistry {
-    /// Create a new waker registry
-    pub fn new() -> Self {
-        Self {
-            wakers: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Register a waker for a task
-    pub fn register(&self, task_id: TaskId, waker: SshBindWaker) {
-        if let Ok(mut wakers) = self.wakers.lock() {
-            wakers.insert(task_id, waker);
-        }
-    }
-
-    /// Unregister a waker for a task
-    pub fn unregister(&self, task_id: TaskId) {
-        if let Ok(mut wakers) = self.wakers.lock() {
-            wakers.remove(&task_id);
-        }
-    }
-
-    /// Wake a task by ID
-    pub fn wake_task(&self, task_id: TaskId) -> bool {
-        if let Ok(wakers) = self.wakers.lock() {
-            if let Some(waker) = wakers.get(&task_id) {
-                waker.wake();
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    }
-
-    /// Get all woken task IDs and clear their flags
-    pub fn drain_woken(&self) -> Vec<TaskId> {
-        let mut woken_tasks = Vec::new();
-        
-        if let Ok(wakers) = self.wakers.lock() {
-            for (&task_id, waker) in wakers.iter() {
-                if waker.is_woken() {
-                    woken_tasks.push(task_id);
-                }
-            }
-        }
-
-        woken_tasks
-    }
-
-    /// Get the number of registered wakers
-    pub fn count(&self) -> usize {
-        if let Ok(wakers) = self.wakers.lock() {
-            wakers.len()
-        } else {
-            0
-        }
-    }
-}
-
-impl Default for WakerRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -200,19 +129,4 @@ mod tests {
         assert!(!waker.is_woken());
     }
 
-    #[test]
-    fn test_waker_registry() {
-        let registry = WakerRegistry::new();
-        let task_id = TaskId(42);
-        let waker = SshBindWaker::new(task_id);
-        
-        registry.register(task_id, waker);
-        assert_eq!(registry.count(), 1);
-        
-        assert!(registry.wake_task(task_id));
-        assert!(!registry.wake_task(TaskId(999))); // Non-existent task
-        
-        registry.unregister(task_id);
-        assert_eq!(registry.count(), 0);
-    }
 }

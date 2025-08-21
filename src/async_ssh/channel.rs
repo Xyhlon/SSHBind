@@ -3,31 +3,27 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use futures::io::{AsyncRead, AsyncWrite};
 
 use crate::async_ssh::Result;
 
 // Async wrapper around ssh2::Channel
-pub struct AsyncChannel<S> {
+pub struct AsyncChannel {
     inner: Arc<Mutex<ssh2::Channel>>,
-    session: Arc<Mutex<ssh2::Session>>,
-    stream: Arc<S>,
     eof_sent: bool,
 }
 
-impl<S> AsyncChannel<S> {
+impl AsyncChannel {
     pub(crate) fn new(
-        mut channel: ssh2::Channel,
-        session: Arc<Mutex<ssh2::Session>>,
-        stream: Arc<S>,
+        channel: ssh2::Channel,
+        _session: Arc<Mutex<ssh2::Session>>,
+        _stream: Arc<()>,
     ) -> Self {
         // SSH2 channels inherit non-blocking from session
         // No need to set explicitly
         
         Self {
             inner: Arc::new(Mutex::new(channel)),
-            session,
-            stream,
             eof_sent: false,
         }
     }
@@ -40,10 +36,8 @@ impl<S> AsyncChannel<S> {
             match channel.exec(command) {
                 Ok(()) => return Ok(()),
                 Err(e) if would_block(&e) => {
-                    // Need to wait for I/O
-                    drop(channel);
-                    tokio::task::yield_now().await;
-                    channel = self.inner.lock().unwrap();
+                    // Need to wait for I/O - yield to allow other tasks to run  
+                    std::thread::yield_now();
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -63,9 +57,8 @@ impl<S> AsyncChannel<S> {
             match channel.request_pty(term, mode.clone(), dim) {
                 Ok(()) => return Ok(()),
                 Err(e) if would_block(&e) => {
-                    drop(channel);
-                    tokio::task::yield_now().await;
-                    channel = self.inner.lock().unwrap();
+                    // Yield control to allow other tasks to run
+                    std::thread::yield_now();
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -80,9 +73,8 @@ impl<S> AsyncChannel<S> {
             match channel.shell() {
                 Ok(()) => return Ok(()),
                 Err(e) if would_block(&e) => {
-                    drop(channel);
-                    tokio::task::yield_now().await;
-                    channel = self.inner.lock().unwrap();
+                    // Yield control to allow other tasks to run
+                    std::thread::yield_now();
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -104,9 +96,8 @@ impl<S> AsyncChannel<S> {
                     return Ok(());
                 }
                 Err(e) if would_block(&e) => {
-                    drop(channel);
-                    tokio::task::yield_now().await;
-                    channel = self.inner.lock().unwrap();
+                    // Yield control to allow other tasks to run
+                    std::thread::yield_now();
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -122,7 +113,8 @@ impl<S> AsyncChannel<S> {
                 Ok(()) => return Ok(()),
                 Err(e) if would_block(&e) => {
                     drop(channel);
-                    tokio::task::yield_now().await;
+                    // Yield control to allow other tasks to run
+                    std::thread::yield_now();
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -137,9 +129,8 @@ impl<S> AsyncChannel<S> {
             match channel.close() {
                 Ok(()) => return Ok(()),
                 Err(e) if would_block(&e) => {
-                    drop(channel);
-                    tokio::task::yield_now().await;
-                    channel = self.inner.lock().unwrap();
+                    // Yield control to allow other tasks to run
+                    std::thread::yield_now();
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -155,7 +146,8 @@ impl<S> AsyncChannel<S> {
                 Ok(()) => return Ok(()),
                 Err(e) if would_block(&e) => {
                     drop(channel);
-                    tokio::task::yield_now().await;
+                    // Yield control to allow other tasks to run
+                    std::thread::yield_now();
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -176,24 +168,22 @@ impl<S> AsyncChannel<S> {
 
 }
 
-impl<S> AsyncRead for AsyncChannel<S> {
+impl AsyncRead for AsyncChannel {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
         let mut channel = self.inner.lock().unwrap();
         
         // Try to read from the channel using std::io::Read
-        let mut temp = vec![0u8; buf.remaining()];
-        match channel.read(&mut temp) {
+        match channel.read(buf) {
             Ok(0) => {
                 // EOF reached
-                Poll::Ready(Ok(()))
+                Poll::Ready(Ok(0))
             }
             Ok(n) => {
-                buf.put_slice(&temp[..n]);
-                Poll::Ready(Ok(()))
+                Poll::Ready(Ok(n))
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 // Need to wait for data
@@ -205,7 +195,7 @@ impl<S> AsyncRead for AsyncChannel<S> {
     }
 }
 
-impl<S> AsyncWrite for AsyncChannel<S> {
+impl AsyncWrite for AsyncChannel {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -239,7 +229,7 @@ impl<S> AsyncWrite for AsyncChannel<S> {
         }
     }
 
-    fn poll_shutdown(
+    fn poll_close(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<()>> {
