@@ -882,8 +882,9 @@ fn find_sops_binary() -> Result<String, String> {
 ///
 /// * `addr` - The local address to bind the server to (e.g., "127.0.0.1:8000").
 /// * `jump_hosts` - A vector of SSH jump host addresses (e.g., vec!["jump1.example.com:22", "jump2.example.com:22"]).
-/// * `remote_addr` - The final remote address to forward connections to (e.g., "remote.example.com:80").
+/// * `remote_addr` - Optional final remote address to forward connections to (e.g., Some("remote.example.com:80".to_string())).
 /// * `sopsfile` - The path to a SOPS-encrypted YAML file containing SSH credentials.
+/// * `cmd` - Optional command to execute on the remote host before connecting (e.g., Some("docker run -p 3000:3000 app".to_string())).
 ///
 /// # Panics
 ///
@@ -903,12 +904,13 @@ fn find_sops_binary() -> Result<String, String> {
 /// fn main() {
 ///     let addr = "127.0.0.1:8000";
 ///     let jump_hosts = vec!["jump1.example.com:22".to_string(), "jump2.example.com:22".to_string()];
-///     let remote_addr = "remote.example.com:80";
+///     let remote_addr = Some("remote.example.com:80".to_string());
 ///     let sopsfile = "/path/to/creds.sops.yaml";
+///     let cmd = None; // No command to execute, just forward
 ///
 ///     // Start the server in a separate thread
 ///     let server_thread = thread::spawn(move || {
-///         bind(addr, jump_hosts, remote_addr, sopsfile);
+///         bind(addr, jump_hosts, remote_addr, sopsfile, cmd);
 ///     });
 ///
 ///     // Perform other tasks or wait for user input

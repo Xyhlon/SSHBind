@@ -70,7 +70,7 @@ As a library, SSHBind exposes two primary functions:
 - `bind`: Establishes the binding of a remote service to a local socket.
 - `unbind`: Removes the existing binding.
 
-**Example Usage:**
+**Basic Example:**
 
 ```rust
 use sshbind::{bind, unbind};
@@ -78,17 +78,47 @@ use sshbind::{bind, unbind};
 fn main() {
     let local_addr = "127.0.0.1:8000";
     let jump_hosts = vec!["jump1:22".to_string(), "jump2:22".to_string()];
-    let remote_addr = "remote.service:80";
+    let remote_addr = Some("remote.service:80".to_string());
     let sopsfile = "secrets.yaml";
+    let cmd = None;
 
-    // Bind the remote service to the local address
-    bind(local_addr, jump_hosts, remote_addr, sopsfile);
+    // Forward connections through jump hosts to remote service
+    bind(local_addr, jump_hosts, remote_addr, sopsfile, cmd);
 
     // ... use the bound service ...
 
     // Unbind when done
     unbind(local_addr);
 }
+```
+
+**API Parameters:**
+
+- `local_addr: &str` - Local address to bind (e.g., "127.0.0.1:8000")
+- `jump_hosts: Vec<String>` - SSH jump hosts to traverse (e.g., vec!["host1:22".to_string()])
+- `remote_addr: Option<String>` - Final destination service address
+  - `Some("host:port")` - Connect to specific service after jumping
+  - `None` - Use with `cmd` for command execution only
+- `sopsfile: &str` - Path to SOPS-encrypted credentials file
+- `cmd: Option<String>` - Optional command to execute on remote host
+  - `None` - Direct port forwarding
+  - `Some("command")` - Execute command, then connect to service
+
+**Usage Patterns:**
+
+1. **Direct Port Forwarding** (most common):
+```rust
+bind("127.0.0.1:8000", jump_hosts, Some("service:80".to_string()), "creds.yaml", None);
+```
+
+2. **Command Execution + Port Forwarding**:
+```rust
+bind("127.0.0.1:8000", jump_hosts, Some("localhost:3000".to_string()), "creds.yaml", Some("docker run -p 3000:3000 myapp".to_string()));
+```
+
+3. **Command Execution Only** (stdio communication):
+```rust
+bind("127.0.0.1:8000", jump_hosts, None, "creds.yaml", Some("python script.py".to_string()));
 ```
 
 For detailed API documentation and advanced usage, refer to the
