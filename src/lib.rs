@@ -406,6 +406,7 @@ where
     
     // Spawn A -> B direction
     executor::spawn(async move {
+        info!("Starting A->B data forwarding task");
         let mut a_read = a_read;
         let mut b_write = b_write;
         let mut buf = vec![0u8; 8192];
@@ -439,6 +440,7 @@ where
     
     // Spawn B -> A direction  
     executor::spawn(async move {
+        info!("Starting B->A data forwarding task");
         let mut b_read = b_read;
         let mut a_write = a_write;
         let mut buf = vec![0u8; 8192];
@@ -679,7 +681,9 @@ async fn connect_chain(
 
         let ssh_session = ssh2::Session::new()?;
         session = AsyncSession::from_parts(ssh_session, client_conn, SessionConfiguration::default())?;
+        info!("Starting SSH handshake for jump host {}", i);
         session.handshake().await?;
+        info!("SSH handshake completed for jump host {}", i);
         userauth(&session, creds_map, &jump_hosts[i]).await?;
     }
 
