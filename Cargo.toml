@@ -49,5 +49,9 @@ log = "0.4.26"
 env_logger = "0.11.6"
 serial_test = "3.2.0"
 
+[[bin]]
+name = "integration_test_runner"
+path = "tests/integration_test_runner.rs"
+
 [target.'cfg(windows)'.dependencies]
 named_pipe = "0.4.1"

@@ -206,6 +206,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "async-ssh2-lite"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e00ee230bcd18bf15547e674950ace76b13fcda3ea1a33acca27e2eab245b58a"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "libssh2-sys",
+ "ssh2",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.88"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2794,6 +2806,7 @@ name = "sshbind"
 version = "0.0.3"
 dependencies = [
  "age",
+ "async-ssh2-lite",
  "async-trait",
  "clap",
  "dirs",
