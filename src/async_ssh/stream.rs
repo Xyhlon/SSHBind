@@ -13,7 +13,7 @@ lazy_static::lazy_static! {
     pub(crate) static ref REACTOR: Reactor = Reactor::new();
 }
 
-struct Reactor {
+pub(crate) struct Reactor {
     poller: Poller,
     sources: Mutex<slab::Slab<Source>>,
 }
