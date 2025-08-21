@@ -4,10 +4,12 @@ use std::sync::{Arc, Mutex};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::io;
 
 use ssh2::{Session, KeyboardInteractivePrompt};
 
 use crate::async_ssh::{AsyncTcpStream, AsyncChannel, Result};
+use crate::async_ssh::stream::REACTOR;
 
 // Configuration for the SSH session
 #[derive(Clone, Debug)]
@@ -76,6 +78,7 @@ impl AsyncSession {
     pub async fn handshake(&self) -> Result<()> {
         HandshakeFuture {
             session: self.inner.clone(),
+            stream: self.stream.clone(),
         }.await
     }
 
@@ -101,6 +104,7 @@ impl AsyncSession {
         
         UserAuthPasswordFuture {
             session,
+            stream: self.stream.clone(),
             username,
             password,
         }.await
@@ -137,6 +141,7 @@ impl AsyncSession {
         
         UserAuthPubkeyFileFuture {
             session,
+            stream: self.stream.clone(),
             username,
             pubkey,
             privatekey,
@@ -151,6 +156,7 @@ impl AsyncSession {
         
         ChannelSessionFuture {
             session: session.clone(),
+            stream: stream.clone(),
         }.await.map(|channel| {
             AsyncChannel::new(channel, session, stream)
         })
@@ -171,6 +177,7 @@ impl AsyncSession {
         
         ChannelDirectTcpipFuture {
             session: session.clone(),
+            stream: stream.clone(),
             host,
             port,
             src_host,
@@ -196,6 +203,7 @@ impl AsyncSession {
 // Future for async handshake
 struct HandshakeFuture {
     session: Arc<Mutex<Session>>,
+    stream: Arc<AsyncTcpStream>,
 }
 
 impl Future for HandshakeFuture {
@@ -207,8 +215,10 @@ impl Future for HandshakeFuture {
         match session.handshake() {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if would_block(&e) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                drop(session);
+                // Wait for socket to be ready for read/write  
+                REACTOR.poll_ready(self.stream.key, cx, false)
+                    .map(|_| Err(crate::async_ssh::Error::Io(io::Error::from(io::ErrorKind::WouldBlock))))
             }
             Err(e) => Poll::Ready(Err(e.into())),
         }
@@ -219,6 +229,7 @@ impl Future for HandshakeFuture {
 // Future for password authentication
 struct UserAuthPasswordFuture {
     session: Arc<Mutex<Session>>,
+    stream: Arc<AsyncTcpStream>,
     username: String,
     password: String,
 }
@@ -232,8 +243,10 @@ impl Future for UserAuthPasswordFuture {
         match session.userauth_password(&self.username, &self.password) {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if would_block(&e) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                drop(session);
+                // Wait for socket to be ready for read/write
+                REACTOR.poll_ready(self.stream.key, cx, false)
+                    .map(|_| Err(crate::async_ssh::Error::Io(io::Error::from(io::ErrorKind::WouldBlock))))
             }
             Err(e) => Poll::Ready(Err(e.into())),
         }
@@ -243,6 +256,7 @@ impl Future for UserAuthPasswordFuture {
 // Future for public key file authentication
 struct UserAuthPubkeyFileFuture {
     session: Arc<Mutex<Session>>,
+    stream: Arc<AsyncTcpStream>,
     username: String,
     pubkey: Option<std::path::PathBuf>,
     privatekey: std::path::PathBuf,
@@ -263,8 +277,10 @@ impl Future for UserAuthPubkeyFileFuture {
         ) {
             Ok(()) => Poll::Ready(Ok(())),
             Err(e) if would_block(&e) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                drop(session);
+                // Wait for socket to be ready for read/write
+                REACTOR.poll_ready(self.stream.key, cx, false)
+                    .map(|_| Err(crate::async_ssh::Error::Io(io::Error::from(io::ErrorKind::WouldBlock))))
             }
             Err(e) => Poll::Ready(Err(e.into())),
         }
@@ -274,6 +290,7 @@ impl Future for UserAuthPubkeyFileFuture {
 // Future for creating session channel
 struct ChannelSessionFuture {
     session: Arc<Mutex<Session>>,
+    stream: Arc<AsyncTcpStream>,
 }
 
 impl Future for ChannelSessionFuture {
@@ -285,8 +302,10 @@ impl Future for ChannelSessionFuture {
         match session.channel_session() {
             Ok(channel) => Poll::Ready(Ok(channel)),
             Err(e) if would_block(&e) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                drop(session);
+                // Wait for socket to be ready for read/write
+                REACTOR.poll_ready(self.stream.key, cx, false)
+                    .map(|_| Err(crate::async_ssh::Error::Io(io::Error::from(io::ErrorKind::WouldBlock))))
             }
             Err(e) => Poll::Ready(Err(e.into())),
         }
@@ -296,6 +315,7 @@ impl Future for ChannelSessionFuture {
 // Future for creating direct TCP/IP channel
 struct ChannelDirectTcpipFuture {
     session: Arc<Mutex<Session>>,
+    stream: Arc<AsyncTcpStream>,
     host: String,
     port: u16,
     src_host: String,
@@ -311,8 +331,10 @@ impl Future for ChannelDirectTcpipFuture {
         match session.channel_direct_tcpip(&self.host, self.port, Some((&self.src_host, self.src_port))) {
             Ok(channel) => Poll::Ready(Ok(channel)),
             Err(e) if would_block(&e) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+                drop(session);
+                // Wait for socket to be ready for write/read
+                REACTOR.poll_ready(self.stream.key, cx, false)
+                    .map(|_| Err(crate::async_ssh::Error::Io(io::Error::from(io::ErrorKind::WouldBlock))))
             }
             Err(e) => Poll::Ready(Err(e.into())),
         }

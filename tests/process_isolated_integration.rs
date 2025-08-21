@@ -4,7 +4,7 @@ use std::time::Duration;
 /// Run a test in the isolated test runner binary
 fn run_isolated_test(test_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let output = Command::new("cargo")
-        .args(&["run", "--bin", "integration_test_runner", "--", test_name])
+        .args(&["run", "--bin", "integration_test_runner", "--features", "tokio", "--", test_name])
         .output()?;
 
     if output.status.success() {

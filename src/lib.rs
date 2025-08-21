@@ -408,6 +408,9 @@ where
         let mut a_to_b_open = true; // reading A, writing to B  
         let mut b_to_a_open = true; // reading B, writing to A
 
+        let mut no_progress_count = 0;
+        const MAX_NO_PROGRESS: usize = 1000;
+
         // Handling this in that way is kinda sus, however afaik libssh2 channel
         // need to handle the shutdown of the write side manually.
         while a_to_b_open || b_to_a_open {
@@ -467,7 +470,13 @@ where
 
             // Small yield to prevent busy looping if no progress
             if !progress {
-                std::future::ready(()).await;
+                no_progress_count += 1;
+                if no_progress_count > MAX_NO_PROGRESS {
+                    warn!("Connection forwarding stalled, breaking");
+                    break;
+                }
+            } else {
+                no_progress_count = 0;
             }
         }
     });

@@ -9,8 +9,9 @@ mod waker;
 mod tests;
 
 use std::future::Future;
-use std::task::Context;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use std::pin::Pin;
 
 pub use reactor::Reactor;
 pub use task::{Task, TaskId};
@@ -169,4 +170,33 @@ where
             executor.run(None).expect("Failed to run executor");
         }
     });
+}
+
+/// Future that yields execution to other tasks
+pub struct YieldNow {
+    yielded: bool,
+}
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.yielded {
+            Poll::Ready(())
+        } else {
+            self.yielded = true;
+            // Schedule to be woken on the next iteration without immediate wake
+            let waker = cx.waker().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                waker.wake();
+            });
+            Poll::Pending
+        }
+    }
+}
+
+/// Yield execution to allow other tasks to run
+pub fn yield_now() -> YieldNow {
+    YieldNow { yielded: false }
 }
