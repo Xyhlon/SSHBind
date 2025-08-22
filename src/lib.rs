@@ -6,25 +6,32 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::Command;
 use std::str::FromStr;
 use std::thread;
-use tokio::runtime::Runtime;
-use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
-use async_ssh2_lite::{AsyncSession, AsyncSessionStream, SessionConfiguration, TokioTcpStream};
+use async_ssh2_lite::{AsyncSession, AsyncSessionStream, SessionConfiguration};
 use libreauth::oath::TOTPBuilder;
 use ssh2_config::{ParseRule, SshConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
-use tokio::io::copy_bidirectional;
-use tokio::io::{AsyncRead, AsyncWrite};
-// use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+
+use async_executor::{Executor, Task};
+use async_io::Async;
+use futures::future::FutureExt;
+use futures::{select, AsyncReadExt, AsyncWriteExt};
+use std::net::{TcpListener as StdTcpListener, TcpStream};
+use async_channel::{Sender, Receiver};
+
+#[cfg(not(unix))]
+use async_io::Async as AsyncTcpListener;
 
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
+
+type AsyncTcpStream = Async<TcpStream>;
+type AsyncTcpListener = Async<StdTcpListener>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPort {
@@ -197,7 +204,7 @@ impl OrderedAuthMethods {
 /// A `Result` indicating success or failure of the authentication process.
 ///
 async fn userauth(
-    session: &AsyncSession<TokioTcpStream>,
+    session: &AsyncSession<AsyncTcpStream>,
     creds_map: &YamlCreds,
     host: &HostPort,
 ) -> Result<(), Box<dyn Error>> {
@@ -335,222 +342,137 @@ async fn userauth(
     }
 }
 
-// Generic bidirectional copy function for both TCP and SSH connections
-// Now works correctly with the patched async-ssh2-lite
+// Generic bidirectional copy function using futures select pattern (matching proxy_jump demo)
 fn connect_duplex<A, B>(
+    ex: Arc<Executor<'_>>,
     mut a: A,
     mut b: B,
-    cancel_token: CancellationToken,
-) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+    _cancel_rx: Receiver<()>,
+) -> Task<std::io::Result<()>>
 where
-    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+    B: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    ex.spawn(async move {
         info!("Data forwarding task starting");
-        tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    warn!("Tunnel Shutdown signal received. Client Connections Reset.");
+
+        let mut buf_a = vec![0; 2048];
+        let mut buf_b = vec![0; 2048];
+
+        loop {
+            select! {
+                ret_a = a.read(&mut buf_a).fuse() => match ret_a {
+                    Ok(0) => {
+                        info!("Connection A read 0");
+                        break;
+                    },
+                    Ok(n) => {
+                        info!("Connection A read {}", n);
+                        if let Err(err) = b.write_all(&buf_a[..n]).await {
+                            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                error!("Write to B failed: {:?}", err);
+                            }
+                            break;
+                        }
+                    },
+                    Err(err) => {
+                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                            error!("Read from A failed: {:?}", err);
+                        }
+                        break;
+                    }
                 },
-        result = copy_bidirectional(&mut a, &mut b) =>{
-        match &result {
-            Ok((bytes_a_to_b, bytes_b_to_a)) => {
-                info!(
-                    "Bridge completed: {} bytes A->B, {} bytes B->A",
-                    bytes_a_to_b, bytes_b_to_a
-                );
+                ret_b = b.read(&mut buf_b).fuse() => match ret_b {
+                    Ok(0) => {
+                        info!("Connection B read 0");
+                        break;
+                    },
+                    Ok(n) => {
+                        info!("Connection B read {}", n);
+                        if let Err(err) = a.write_all(&buf_b[..n]).await {
+                            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                error!("Write to A failed: {:?}", err);
+                            }
+                            break;
+                        }
+                    },
+                    Err(err) => {
+                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                            error!("Read from B failed: {:?}", err);
+                        }
+                        break;
+                    }
+                },
             }
-            Err(e) => {
-                // Don't log broken pipe as error - it's normal when connections close
-                if e.kind() == std::io::ErrorKind::BrokenPipe
-                    || e.kind() == std::io::ErrorKind::ConnectionReset
-                    || e.kind() == std::io::ErrorKind::UnexpectedEof
-                    || e.to_string().contains("draining incoming flow")
-                {
-                    info!("Bridge closed: {}", e);
-                } else {
-                    error!("Bridge failed: {}", e);
-                }
-            }
         }
-        }
-        }
-        // Use manual copying for better control and debugging
-        // let mut buf_a = vec![0u8; 64 * 1024];
-        // let mut buf_b = vec![0u8; 64 * 1024];
-        // let mut total_a_to_b = 0u64;
-        // let mut total_b_to_a = 0u64;
-        //
-        // loop {
-        //     tokio::select! {
-        //         biased; // Process branches in order, not randomly
-        //
-        //         res = a.read(&mut buf_a) => {
-        //             match res {
-        //                 Ok(0) => {
-        //                     info!("Connection closed by A. Total transferred {} bytes A->B, {} bytes B->A",
-        //                           total_a_to_b, total_b_to_a);
-        //                     break;
-        //                 }
-        //                 Ok(n) => {
-        //                     if let Err(e) = b.write_all(&buf_a[..n]).await {
-        //                         if e.kind() != std::io::ErrorKind::BrokenPipe {
-        //                             error!("Write error A->B: {}", e);
-        //                         }
-        //                         break;
-        //                     }
-        //                     total_a_to_b += n as u64;
-        //                 }
-        //                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-        //                     info!("EOF from A. Total transferred {} bytes A->B, {} bytes B->A",
-        //                           total_a_to_b, total_b_to_a);
-        //                     break;
-        //                 }
-        //                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-        //                     // This should never happen in proper async code
-        //                     // But if it does, yield to prevent busy-waiting
-        //                     tokio::task::yield_now().await;
-        //                 }
-        //                 Err(e) => {
-        //                     error!("Read error from A: {}", e);
-        //                     return Err(e);
-        //                 }
-        //             }
-        //         }
-        //         res = b.read(&mut buf_b) => {
-        //             match res {
-        //                 Ok(0) => {
-        //                     info!("Connection closed by B. Total transferred {} bytes A->B, {} bytes B->A",
-        //                           total_a_to_b, total_b_to_a);
-        //                     break;
-        //                 }
-        //                 Ok(n) => {
-        //                     if let Err(e) = a.write_all(&buf_b[..n]).await {
-        //                         if e.kind() != std::io::ErrorKind::BrokenPipe {
-        //                             error!("Write error B->A: {}", e);
-        //                         }
-        //                         break;
-        //                     }
-        //                     total_b_to_a += n as u64;
-        //                 }
-        //                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-        //                     info!("EOF from B. Total transferred {} bytes A->B, {} bytes B->A",
-        //                           total_a_to_b, total_b_to_a);
-        //                     break;
-        //                 }
-        //                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-        //                     // This should never happen in proper async code
-        //                     // But if it does, yield to prevent busy-waiting
-        //                     tokio::task::yield_now().await;
-        //                 }
-        //                 Err(e) => {
-        //                     error!("Read error from B: {}", e);
-        //                     return Err(e);
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
 
         Ok(())
     })
 }
 
-// Special version for chain connections that needs to keep the tunnel open
-// Uses manual copying to ensure the connection stays alive
+// Special version for chain connections (matching proxy_jump demo)
 fn connect_chain_tunnel<A, B>(
+    ex: Arc<Executor<'_>>,
     mut a: A,
     mut b: B,
-    cancel_token: CancellationToken,
-) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+    _cancel_rx: Receiver<()>,
+) -> Task<std::io::Result<()>>
 where
-    A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    A: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+    B: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    ex.spawn(async move {
         info!("Bridge task starting");
-        tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    warn!("Shutdown signal received. Stopping server.");
+
+        let mut buf_a = vec![0; 2048];
+        let mut buf_b = vec![0; 2048];
+
+        loop {
+            select! {
+                ret_a = a.read(&mut buf_a).fuse() => match ret_a {
+                    Ok(0) => {
+                        info!("Bridge connection A read 0");
+                        break;
+                    },
+                    Ok(n) => {
+                        info!("Bridge connection A read {}", n);
+                        if let Err(err) = b.write_all(&buf_a[..n]).await {
+                            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                error!("Bridge write to B failed: {:?}", err);
+                            }
+                            break;
+                        }
+                    },
+                    Err(err) => {
+                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                            error!("Bridge read from A failed: {:?}", err);
+                        }
+                        break;
+                    }
                 },
-        result = copy_bidirectional(&mut a, &mut b) =>{
-        match &result {
-            Ok((bytes_a_to_b, bytes_b_to_a)) => {
-                info!(
-                    "Bridge completed: {} bytes A->B, {} bytes B->A",
-                    bytes_a_to_b, bytes_b_to_a
-                );
+                ret_b = b.read(&mut buf_b).fuse() => match ret_b {
+                    Ok(0) => {
+                        info!("Bridge connection B read 0");
+                        break;
+                    },
+                    Ok(n) => {
+                        info!("Bridge connection B read {}", n);
+                        if let Err(err) = a.write_all(&buf_b[..n]).await {
+                            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                error!("Bridge write to A failed: {:?}", err);
+                            }
+                            break;
+                        }
+                    },
+                    Err(err) => {
+                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                            error!("Bridge read from B failed: {:?}", err);
+                        }
+                        break;
+                    }
+                },
             }
-            Err(e) => {
-                // Don't log broken pipe as error - it's normal when connections close
-                if e.kind() == std::io::ErrorKind::BrokenPipe
-                    || e.kind() == std::io::ErrorKind::ConnectionReset
-                    || e.kind() == std::io::ErrorKind::UnexpectedEof
-                    || e.to_string().contains("draining incoming flow")
-                {
-                    info!("Bridge closed: {}", e);
-                } else {
-                    error!("Bridge failed: {}", e);
-                }
-            }
         }
-        }
-        }
-        // let mut buf_a = vec![0u8; 64 * 1024];
-        // let mut buf_b = vec![0u8; 64 * 1024];
-        //
-        // loop {
-        //     tokio::select! {
-        //         biased; // Process branches in order, not randomly
-        //
-        //         res = a.read(&mut buf_a) => {
-        //             match res {
-        //                 Ok(0) => break, // EOF
-        //                 Ok(n) => {
-        //                     if let Err(e) = b.write_all(&buf_a[..n]).await {
-        //                         if e.kind() != std::io::ErrorKind::BrokenPipe {
-        //                             error!("Write error in chain tunnel: {}", e);
-        //                         }
-        //                         break;
-        //                     }
-        //                 }
-        //                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-        //                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-        //                     // This should never happen in proper async code
-        //                     // But if it does, yield to prevent busy-waiting
-        //                     tokio::task::yield_now().await;
-        //                 }
-        //                 Err(e) => {
-        //                     error!("Read error in chain tunnel: {}", e);
-        //                     return Err(e);
-        //                 }
-        //             }
-        //         }
-        //         res = b.read(&mut buf_b) => {
-        //             match res {
-        //                 Ok(0) => break, // EOF
-        //                 Ok(n) => {
-        //                     if let Err(e) = a.write_all(&buf_b[..n]).await {
-        //                         if e.kind() != std::io::ErrorKind::BrokenPipe {
-        //                             error!("Write error in chain tunnel: {}", e);
-        //                         }
-        //                         break;
-        //                     }
-        //                 }
-        //                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-        //                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-        //                     // This should never happen in proper async code
-        //                     // But if it does, yield to prevent busy-waiting
-        //                     tokio::task::yield_now().await;
-        //                 }
-        //                 Err(e) => {
-        //                     error!("Read error in chain tunnel: {}", e);
-        //                     return Err(e);
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
 
         Ok(())
     })
@@ -726,14 +648,16 @@ where
 /// or an error if the connection fails.
 ///
 async fn connect_chain(
+    ex: Arc<Executor<'_>>,
     jump_hosts: &[HostPort],
     creds_map: &YamlCreds,
-    cancel_token: CancellationToken,
-) -> Result<AsyncSession<TokioTcpStream>, Box<dyn Error>> {
+    _cancel_tx: Sender<()>,
+) -> Result<AsyncSession<AsyncTcpStream>, Box<dyn Error>> {
     assert!(!jump_hosts.is_empty(), "No jump hosts provided");
     info!("Starting SSH chain connection through {:?}", jump_hosts);
 
-    let mut session = AsyncSession::<TokioTcpStream>::connect(jump_hosts[0].clone(), None).await?;
+    let stream = AsyncTcpStream::connect(jump_hosts[0].clone()).await?;
+    let mut session = AsyncSession::new(stream, SessionConfiguration::default())?;
     session.handshake().await?;
     userauth(&session, creds_map, &jump_hosts[0]).await?;
 
@@ -745,21 +669,23 @@ async fn connect_chain(
             .await?;
         info!("Channel created successfully!");
 
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let local_addr = listener.local_addr()?;
+        let listener = AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>()?)?;
+        let local_addr = listener.get_ref().local_addr()?;
         info!("Local bridge listening on {}", local_addr);
 
-        let accept_task =
-            tokio::spawn(async move { listener.accept().await.map(|(local_conn, _)| local_conn) });
+        let accept_task = ex.spawn(async move {
+            listener.accept().await.map(|(local_conn, _)| local_conn)
+        });
 
-        let client_conn = TokioTcpStream::connect(local_addr).await?;
-        let server_conn = accept_task.await?.map_err(|e| e.to_string())?;
+        let client_conn = AsyncTcpStream::connect(local_addr).await?;
+        let server_conn = accept_task.await.map_err(|e| e.to_string())?;
 
         // Use the chain tunnel version to keep the connection alive
-        connect_chain_tunnel(server_conn, channel, cancel_token.clone());
+        let (_bridge_tx, bridge_rx) = async_channel::unbounded();
+        connect_chain_tunnel(ex.clone(), server_conn, channel, bridge_rx).detach();
 
         // Give the bridge task a moment to start
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        std::thread::sleep(Duration::from_millis(10));
 
         session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
         session.handshake().await?;
@@ -770,12 +696,13 @@ async fn connect_chain(
 }
 
 async fn connect_to_tunnel<S>(
-    inbound: TokioTcpStream,
+    ex: Arc<Executor<'_>>,
+    inbound: AsyncTcpStream,
     session: AsyncSession<S>,
     jump_hosts: &[HostPort],
     remote_addr: Option<&HostPort>,
     cmd: Option<&str>,
-    cancel_token: CancellationToken,
+    cancel_rx: Receiver<()>,
 ) -> Result<(), Box<dyn Error>>
 where
     S: AsyncSessionStream + Send + Sync + 'static,
@@ -787,9 +714,9 @@ where
             .to_socket_addrs()?
             .next()
             .expect("Failed to resolve remote address");
-        let outbound = TokioTcpStream::connect(socket).await?;
+        let outbound = AsyncTcpStream::connect(socket).await?;
 
-        connect_duplex(inbound, outbound, cancel_token.clone());
+        connect_duplex(ex, inbound, outbound, cancel_rx).detach();
         // tokio::spawn(async move {
         //     let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
         // });
@@ -816,7 +743,7 @@ where
                 // I know this isn't the cleanest solution
                 // open for suggestions
                 let mut counter = 0;
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                std::thread::sleep(Duration::from_millis(500));
                 loop {
                     match session
                         .channel_direct_tcpip(&remote_addr.host, remote_addr.port, None)
@@ -825,7 +752,7 @@ where
                         Ok(channel) => {
                             info!("SSH channel established ");
                             info!("Connected to remote address: {}", remote_addr);
-                            connect_duplex(inbound, channel, cancel_token.clone());
+                            connect_duplex(ex.clone(), inbound, channel, cancel_rx).detach();
                             break;
                         }
                         Err(err) => {
@@ -838,7 +765,7 @@ where
                             // Exponential backoff for high concurrency
                             let delay = 50;
                             error!("remote not ready yet: {err}, retrying in {}ms…", delay);
-                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                            std::thread::sleep(Duration::from_millis(delay));
                         }
                     }
                 }
@@ -855,7 +782,7 @@ where
                 // if exit_code != 0 {
                 //     error!("Command execution failed with exit code: {}", exit_code);
                 // }
-                connect_duplex(inbound, channel, cancel_token.clone());
+                connect_duplex(ex.clone(), inbound, channel, cancel_rx).detach();
             }
             (None, Some(remote_addr)) => {
                 // It is assumed that after the jumping through the
@@ -868,7 +795,7 @@ where
                     Ok(channel) => {
                         info!("SSH channel established ");
                         info!("Connected to remote address: {}", remote_addr);
-                        connect_duplex(inbound, channel, cancel_token.clone());
+                        connect_duplex(ex.clone(), inbound, channel, cancel_rx).detach();
                     }
                     Err(err) => return Err(err.into()),
                 }
@@ -908,15 +835,16 @@ where
 /// * Forwarding data between the local connection and the SSH channel fails.
 ///
 async fn run_server(
+    ex: Arc<Executor<'_>>,
     addr: &str,
     jump_hosts: Vec<HostPort>,
     remote_addr: Option<HostPort>,
     cmd: Option<&str>,
     creds: YamlCreds,
-    cancel_token: CancellationToken,
+    cancel_rx: Receiver<()>,
     pair: Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = AsyncTcpListener::bind(addr.parse::<SocketAddr>()?)?;
     info!("Listening on {addr}");
     {
         let (lock, cvar) = &*pair;
@@ -926,43 +854,51 @@ async fn run_server(
         cvar.notify_one();
     }
     let remote_addr = remote_addr.as_ref();
-    let mut tunnel_cancel_token = CancellationToken::new();
-    let mut session = connect_chain(&jump_hosts, &creds, tunnel_cancel_token.clone()).await?;
+    let (tunnel_cancel_tx, tunnel_cancel_rx) = async_channel::unbounded();
+    let session = connect_chain(ex.clone(), &jump_hosts, &creds, tunnel_cancel_tx.clone()).await?;
     info!("SSH session established");
-    let sem = tokio::sync::Semaphore::new(1);
     loop {
-        tokio::select! {
-                _ = cancel_token.cancelled() => {
-                    warn!("Shutdown signal received. Stopping server.");
-                    break;
-                }
-                sock_result = listener.accept() => {
-                    let _permit = sem.acquire().await.ok();
-                    let sock = match sock_result {
-                        Ok((sock, _)) => {
-                            sock
-                        }
-                        Err(e) => {
-                            error!("Failed to accept connection: {e}");
-                            return Err(e.into());
-                        }
-                    };
-                    let result = connect_to_tunnel(sock, session.clone(), &jump_hosts, remote_addr, cmd, tunnel_cancel_token.clone()).await;
-                    match result {
+        select! {
+            _ = cancel_rx.recv().fuse() => {
+                warn!("Shutdown signal received. Stopping server.");
+                break;
+            }
+            sock_result = listener.accept().fuse() => {
+                let sock = match sock_result {
+                    Ok((sock, _)) => sock,
+                    Err(e) => {
+                        error!("Failed to accept connection: {e}");
+                        return Err(e.into());
+                    }
+                };
+
+                // Handle each connection in a separate task
+                let session_clone = session.clone();
+                let jump_hosts_clone = jump_hosts.clone();
+                let remote_addr_clone = remote_addr.cloned();
+                let cmd_clone = cmd.map(|s| s.to_string());
+                let tunnel_rx = tunnel_cancel_rx.clone();
+                let ex_clone = ex.clone();
+
+                ex.spawn(async move {
+                    match connect_to_tunnel(
+                        ex_clone,
+                        sock,
+                        session_clone,
+                        &jump_hosts_clone,
+                        remote_addr_clone.as_ref(),
+                        cmd_clone.as_deref(),
+                        tunnel_rx,
+                    ).await {
                         Ok(_) => {
-                            continue;
+                            info!("Connection handled successfully");
                         }
                         Err(e) => {
-                            error!("Failed to connect to tunnel: {e}");
-                            info!("Rebuilding SSH session + Tunnel...");
-                            tunnel_cancel_token.cancel();
-                            tunnel_cancel_token = CancellationToken::new();
-                            session = connect_chain(&jump_hosts, &creds, tunnel_cancel_token.clone()).await?;
-                            info!("Tunnel is rebuild...");
-                            continue;
+                            error!("Failed to handle connection: {e}");
+                            // Note: Session rebuild should be handled at a higher level
                         }
                     }
-
+                }).detach();
             }
         }
     }
@@ -1109,33 +1045,44 @@ pub fn bind(
         }
     };
 
-    let cancel_token = CancellationToken::new();
-    let token_clone = cancel_token.clone();
+    let (cancel_tx, cancel_rx) = async_channel::unbounded();
     let bind_addr = addr.to_string();
 
     let pair = Arc::new((Mutex::new(true), Condvar::new()));
     let pair_clone = Arc::clone(&pair);
 
     let handle = thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            if let Err(e) = run_server(
-                &bind_addr,
-                jump_hosts,
-                remote_addr,
-                cmd.as_deref(),
-                creds,
-                token_clone,
-                pair_clone,
-            )
-            .await
-            {
-                error!("Server error: {e}");
-            }
-        });
+        use async_executor::{Executor, LocalExecutor};
+        use easy_parallel::Parallel;
+        use futures::executor::block_on;
+
+        let ex = Arc::new(Executor::new());
+        let local_ex = LocalExecutor::new();
+        let (trigger, shutdown) = async_channel::unbounded::<()>();
+
+        let _result = Parallel::new()
+            .each(0..4, |_| block_on(ex.run(async { shutdown.recv().await })))
+            .finish(|| {
+                block_on(local_ex.run(async {
+                    if let Err(e) = run_server(
+                        ex.clone(),
+                        &bind_addr,
+                        jump_hosts,
+                        remote_addr,
+                        cmd.as_deref(),
+                        creds,
+                        cancel_rx,
+                        pair_clone,
+                    ).await {
+                        error!("Server error: {e}");
+                    }
+
+                    drop(trigger);
+                }))
+            });
     });
 
-    binds.insert(addr.to_string(), (cancel_token, handle));
+    binds.insert(addr.to_string(), (cancel_tx, handle));
 
     // Wait for the thread to start up, bind and listen.
     let (lock, cvar) = &*pair;
@@ -1160,7 +1107,7 @@ pub struct Creds {
 
 #[allow(clippy::type_complexity)]
 static BINDINGS: LazyLock<
-    Mutex<HashMap<String, (CancellationToken, std::thread::JoinHandle<()>)>>,
+    Mutex<HashMap<String, (Sender<()>, std::thread::JoinHandle<()>)>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Unbinds a previously established binding for the given address.
@@ -1182,10 +1129,10 @@ static BINDINGS: LazyLock<
 /// ```
 pub fn unbind(addr: &str) {
     let mut binds = BINDINGS.lock().unwrap();
-    if let Some((cancel_token, handle)) = binds.remove(addr) {
+    if let Some((cancel_tx, handle)) = binds.remove(addr) {
         info!("Destructing binding on {}", addr);
         info!("Signaling cancellation...");
-        cancel_token.cancel();
+        cancel_tx.close();
         if let Err(e) = handle.join() {
             error!("Failed to join thread for {}: {:?}", addr, e);
         } else {
