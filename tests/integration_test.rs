@@ -39,6 +39,7 @@ fn fail_not_path() {
 
 #[tokio::test]
 #[serial]
+#[ignore = "Requires SSH server mock infrastructure"]
 async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn std::error::Error>> {
     #[allow(clippy::let_unit_value)]
     let _ = *LOGGER; // Ensure logger is initialized
@@ -183,6 +184,7 @@ async fn serial_integration_test_correct_configuration() -> Result<(), Box<dyn s
 
 #[tokio::test]
 #[serial]
+#[ignore = "Requires SSH server mock infrastructure"]
 async fn serial_integration_test_correct_configuration_multiple(
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[allow(clippy::let_unit_value)]
@@ -343,6 +345,7 @@ async fn serial_integration_test_correct_configuration_multiple(
 
 #[tokio::test]
 #[serial]
+#[ignore = "Requires SSH server mock infrastructure"]
 async fn serial_integration_test_second_server_wrong_credentials(
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[allow(clippy::let_unit_value)]
@@ -483,6 +486,7 @@ async fn serial_integration_test_second_server_wrong_credentials(
 
 #[tokio::test]
 #[serial]
+#[ignore = "Requires SSH server mock infrastructure"]
 async fn serial_integration_test_correct_configuration_2fa(
 ) -> Result<(), Box<dyn std::error::Error>> {
     #[allow(clippy::let_unit_value)]

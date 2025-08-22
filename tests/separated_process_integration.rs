@@ -92,6 +92,7 @@ while True:
 
 #[test]
 #[serial]
+#[ignore = "SSH server infrastructure issues"]
 fn test_process_separated_ssh_chain() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .is_test(true)
