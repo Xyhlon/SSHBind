@@ -17,7 +17,6 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// **Given**: A bind call with debug flag set to Some(true)
     /// **When**: The bind function is called
