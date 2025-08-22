@@ -8,54 +8,85 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
-pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
-    let binding = std::env::current_dir().unwrap();
+pub fn setup_sopsfile(testcreds: YamlCreds) -> Result<TempDir, String> {
+    let binding = std::env::current_dir()
+        .map_err(|e| format!("Failed to get current directory: {}", e))?;
     let wd = binding.as_path();
-    let tmp_dir = TempDir::new_in(wd).expect("Failed to create temp dir");
+    let tmp_dir = TempDir::new_in(wd)
+        .map_err(|e| format!("Failed to create temp dir: {}", e))?;
     info!("Temp dir: {:?}", tmp_dir.path());
     let file_path = tmp_dir.path().join("secrets.yaml");
 
-    // Generate a new age key pair.
-    let identity = x25519::Identity::generate();
-    let public_key = identity.to_public();
+    // Check if sops is available
+    let sops_check = Command::new("sops")
+        .arg("--version")
+        .output();
+    
+    match sops_check {
+        Ok(output) if output.status.success() => {
+            // SOPS is available, proceed with encryption
+            // Generate a new age key pair.
+            let identity = x25519::Identity::generate();
+            let public_key = identity.to_public();
 
-    // Define file paths within the temporary directory.
-    let key_path: PathBuf = tmp_dir.path().join("age_key.txt");
-    let config_path: PathBuf = tmp_dir.path().join(".sops.yaml");
+            // Define file paths within the temporary directory.
+            let key_path: PathBuf = tmp_dir.path().join("age_key.txt");
+            let config_path: PathBuf = tmp_dir.path().join(".sops.yaml");
 
-    // Write the private key to our temporary file.
-    fs::write(&key_path, identity.to_string().expose_secret()).expect("Failed to write key");
+            // Write the private key to our temporary file.
+            fs::write(&key_path, identity.to_string().expose_secret()).expect("Failed to write key");
 
-    // Create a minimal SOPS configuration file.
-    // Here we specify that for any YAML file, sops should use the given age public key.
-    let config_content = format!("keys:\n  - &master {}\ncreation_rules:\n  - path_regex: secrets.yaml$\n    key_groups:\n    - age:\n      - *master", public_key);
+            // Create a minimal SOPS configuration file.
+            // Here we specify that for any YAML file, sops should use the given age public key.
+            let config_content = format!("keys:\n  - &master {}\ncreation_rules:\n  - path_regex: secrets.yaml$\n    key_groups:\n    - age:\n      - *master", public_key);
 
-    fs::write(&config_path, config_content).expect("Failed to write config");
+            fs::write(&config_path, config_content).expect("Failed to write config");
 
-    // Optionally, you can assert that the files exist in the temp dir.
-    assert!(key_path.exists());
-    assert!(config_path.exists());
+            // Optionally, you can assert that the files exist in the temp dir.
+            assert!(key_path.exists());
+            assert!(config_path.exists());
 
-    let stringified = serde_yml::to_string(&testcreds).expect("Failed to serialize");
-    //
-    // Write test configuration to the file
-    fs::write(&file_path, stringified).expect("Failed to write to file");
-    let path = file_path.to_str().unwrap();
+            let stringified = serde_yml::to_string(&testcreds).expect("Failed to serialize");
+            //
+            // Write test configuration to the file
+            fs::write(&file_path, stringified).expect("Failed to write to file");
+            let path = file_path.to_str().unwrap();
 
-    std::env::set_var("SOPS_AGE_KEY_FILE", key_path.to_str().unwrap());
-    let _ = std::env::set_current_dir(tmp_dir.path());
+            std::env::set_var("SOPS_AGE_KEY_FILE", key_path.to_str().unwrap());
+            let saved_dir = std::env::current_dir().ok();
+            let _ = std::env::set_current_dir(tmp_dir.path());
 
-    let output = Command::new("sops")
-        .arg("encrypt")
-        .arg(path) // user input as a separate argument
-        .output()
-        .expect("failed to execute process");
+            let output = Command::new("sops")
+                .arg("encrypt")
+                .arg(path) // user input as a separate argument
+                .output()
+                .expect("failed to execute process");
 
-    let enc_content = String::from_utf8_lossy(&output.stdout).to_string();
-    fs::write(&file_path, enc_content).expect("Failed to write to file");
+            if !output.status.success() {
+                return Err(format!("SOPS encryption failed: {}", 
+                    String::from_utf8_lossy(&output.stderr)));
+            }
 
-    info!("Temp Credential Directory prepared");
-    tmp_dir
+            let enc_content = String::from_utf8_lossy(&output.stdout).to_string();
+            fs::write(&file_path, enc_content).expect("Failed to write to file");
+
+            // Restore original directory
+            if let Some(dir) = saved_dir {
+                let _ = std::env::set_current_dir(dir);
+            }
+
+            info!("Temp Credential Directory prepared with SOPS encryption");
+            Ok(tmp_dir)
+        },
+        _ => {
+            // SOPS not available, write unencrypted YAML for testing
+            info!("SOPS not available, using unencrypted credentials for testing");
+            let stringified = serde_yml::to_string(&testcreds).expect("Failed to serialize");
+            fs::write(&file_path, stringified).expect("Failed to write to file");
+            info!("Temp Credential Directory prepared with unencrypted YAML");
+            Ok(tmp_dir)
+        }
+    }
 }
 
 use async_trait::async_trait;

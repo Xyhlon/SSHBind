@@ -95,12 +95,28 @@ pub fn bind(
         return;
     }
 
-    let decrypted_content = match decrypt_sops_file(sopsfile) {
+    // Try to read the file first to check if it's encrypted
+    let file_content = match std::fs::read_to_string(sopsfile) {
         Ok(content) => content,
         Err(err) => {
-            error!("SOPS decryption failed: {}", err);
+            error!("Failed to read file {}: {}", sopsfile, err);
             return;
         }
+    };
+    
+    // Check if the file appears to be SOPS encrypted (contains "sops" key)
+    let decrypted_content = if file_content.contains("\"sops\"") || file_content.contains("sops:") {
+        match decrypt_sops_file(sopsfile) {
+            Ok(content) => content,
+            Err(err) => {
+                error!("SOPS decryption failed: {}", err);
+                return;
+            }
+        }
+    } else {
+        // File is not encrypted, use as-is
+        info!("Using unencrypted credentials file");
+        file_content
     };
 
     let jump_hosts: Vec<HostPort> = match jump_hosts

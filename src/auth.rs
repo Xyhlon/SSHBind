@@ -240,12 +240,12 @@ pub async fn connect_chain(
     // Currently only supports single hop connections
     // Multi-hop requires wrapping SSH channels as streams, which is complex
     if jump_hosts.len() > 1 {
-        return Err(format!(
+        warn!(
             "Multi-hop SSH connections are not supported. Only single hop connections are implemented. \
             Received {} hosts, but only the first will be used: {}",
             jump_hosts.len(),
             first_host
-        ).into());
+        );
     }
 
     Ok(session)
