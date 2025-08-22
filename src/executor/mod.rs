@@ -112,4 +112,26 @@ where
     });
 }
 
+/// Yield control to allow other tasks to run
+pub async fn yield_now() {
+    struct YieldNow {
+        yielded: bool,
+    }
+
+    impl Future for YieldNow {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                Poll::Pending
+            }
+        }
+    }
+
+    YieldNow { yielded: false }.await
+}
+
 
