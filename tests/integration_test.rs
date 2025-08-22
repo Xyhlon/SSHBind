@@ -1,6 +1,5 @@
 use env_logger::Builder;
 use log::LevelFilter;
-use russh::server::Server;
 use serial_test::serial;
 use sshbind::{bind, unbind};
 use sshbind::{Creds, YamlCreds};

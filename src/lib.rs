@@ -15,6 +15,66 @@ use tokio::net::{TcpListener, TcpStream};
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Given**: A bind call with debug flag set to Some(true)
+    /// **When**: The bind function is called
+    /// **Then**: Debug simulation should be triggered before normal server operation
+    #[test]
+    fn test_debug_flag_enabled_triggers_simulation() {
+        // This test will fail initially - we need to modify run_server to be testable
+        // Currently run_server is not easily testable due to blocking operations
+        assert!(false, "Debug simulation behavior needs verification");
+    }
+
+    /// **Given**: A bind call with debug flag set to Some(false)  
+    /// **When**: The bind function is called
+    /// **Then**: No debug simulation should occur, only normal server behavior
+    #[test]
+    fn test_debug_flag_disabled_no_simulation() {
+        // This test will fail initially - we need to extract debug logic for testing
+        assert!(false, "Non-debug behavior needs verification");
+    }
+
+    /// **Given**: A bind call with debug flag set to None
+    /// **When**: The bind function is called  
+    /// **Then**: No debug simulation should occur, only normal server behavior
+    #[test]
+    fn test_debug_flag_none_no_simulation() {
+        // This test will fail initially - we need to extract debug logic for testing
+        assert!(false, "None debug behavior needs verification");
+    }
+
+    /// **Given**: Debug credentials and jump hosts configuration
+    /// **When**: Debug simulation runs with the SSH connection chain
+    /// **Then**: The connect_chain function should be called and complete successfully
+    #[test]
+    fn test_debug_simulation_calls_connect_chain() {
+        // This test will fail initially - we need to make connect_chain testable
+        assert!(false, "Debug simulation connect_chain call needs verification");
+    }
+
+    /// **Given**: A debug-enabled server configuration
+    /// **When**: Debug simulation is triggered
+    /// **Then**: Debug output messages should be printed to stdout
+    #[test] 
+    fn test_debug_simulation_outputs_debug_messages() {
+        // This test will fail initially - we need to capture stdout in tests
+        assert!(false, "Debug message output needs verification");
+    }
+
+    /// **Given**: Debug simulation with invalid jump host configuration
+    /// **When**: Debug simulation attempts to connect
+    /// **Then**: The simulation should handle errors gracefully
+    #[test]
+    fn test_debug_simulation_error_handling() {
+        // This test will fail initially - need to test error scenarios
+        assert!(false, "Debug simulation error handling needs verification");
+    }
+}
+
 /// Checks if the `sops` binary is available in the system's PATH and returns its path if found.
 ///
 /// # Returns
@@ -259,61 +319,6 @@ async fn connect_chain(
 /// * Accepting incoming connections fails.
 /// * Establishing an SSH session to any of the jump hosts fails.
 /// * Forwarding data between the local connection and the SSH channel fails.
-///
-// async fn run_server(
-//     addr: &str,
-//     jump_hosts: Vec<String>,
-//     remote_addr: &str,
-//     creds: YamlCreds,
-//     cancel_token: CancellationToken,
-//     pair: Arc<(Mutex<bool>, Condvar)>,
-//     debug: Option<bool>,
-// ) -> Result<(), Box<dyn Error>> {
-//     let listener = TcpListener::bind(addr).await?;
-//     info!("Listening on {addr}");
-//     if let Some(debug) = debug {
-//         if debug {
-//             println!("Debugging enabled");
-//             // std::thread::sleep(std::time::Duration::from_secs(1));
-//             // TcpStream::connect(&jump_hosts[0]).await?;
-//             connect_chain(&jump_hosts, &creds).await?;
-//             println!("Connection ");
-//         }
-//     }
-//     {
-//         let (lock, cvar) = &*pair;
-//         let mut pending = lock.lock().unwrap();
-//         *pending = false;
-//         // We notify the condvar that the value has changed.
-//         println!("Done");
-//         cvar.notify_one();
-//     }
-//
-//     loop {
-//         tokio::select! {
-//             _ = cancel_token.cancelled() => {
-//                 warn!("Shutdown signal received. Stopping server.");
-//                 break;
-//             }
-//             result = listener.accept() => {
-//                 match result {
-//                     Ok((mut inbound, _)) => {
-//                         let session = connect_chain(&jump_hosts, &creds).await?;
-//                         let remote_socket_addr = remote_addr.to_socket_addrs()?.next().ok_or("Failed to resolve remote address")?;
-//                         let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
-//                         tokio::spawn(async move {
-//                             if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-//                                 error!("Connection error: {e}");
-//                             }
-//                         });
-//                     }
-//                     Err(e) => error!("Failed to accept connection: {e}")
-//                 }
-//             }
-//         }
-//     }
-//     Ok(())
-// }
 
 #[allow(clippy::needless_doctest_main)]
 /// Binds a local address to a server that forwards incoming TCP connections through a chain
