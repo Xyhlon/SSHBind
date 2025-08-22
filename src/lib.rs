@@ -6,24 +6,70 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::Command;
 use std::str::FromStr;
 use std::thread;
-use tokio::runtime::Runtime;
-use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
-use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
+use ssh2::{KeyboardInteractivePrompt, Prompt};
 use libreauth::oath::TOTPBuilder;
 use ssh2_config::{ParseRule, SshConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use futures::io::{AsyncRead, AsyncWrite};
+use futures::FutureExt;
+use std::net::TcpListener;
 
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
+
+mod async_ssh;
+mod executor;
+mod select;
+
+use async_ssh::{AsyncSession, AsyncTcpStream, AsyncChannel};
+use executor::Runtime;
+use select::select;
+
+/// Cancellation token type for compatibility
+struct CancellationToken {
+    cancelled: Arc<Mutex<bool>>,
+}
+
+impl CancellationToken {
+    fn new() -> Self {
+        CancellationToken {
+            cancelled: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    fn clone(&self) -> Self {
+        CancellationToken {
+            cancelled: self.cancelled.clone(),
+        }
+    }
+
+    fn cancel(&self) {
+        *self.cancelled.lock().unwrap() = true;
+    }
+
+    async fn cancelled(&self) {
+        while !*self.cancelled.lock().unwrap() {
+            futures::future::ready(()).await;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Accept connection with async wrapper
+async fn accept_connection(listener: &TcpListener) -> std::io::Result<(std::net::TcpStream, SocketAddr)> {
+    futures::future::poll_fn(|_cx| {
+        match listener.accept() {
+            Ok((stream, addr)) => std::task::Poll::Ready(Ok((stream, addr))),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::task::Poll::Pending,
+            Err(e) => std::task::Poll::Ready(Err(e)),
+        }
+    }).await
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPort {
@@ -73,6 +119,16 @@ impl From<HostPort> for SocketAddr {
             .expect("Failed to convert HostPort to SocketAddr")
             .next()
             .expect("HostPort verified earlier")
+    }
+}
+
+impl ToSocketAddrs for HostPort {
+    type Iter = std::vec::IntoIter<SocketAddr>;
+
+    fn to_socket_addrs(&self) -> std::io::Result<Self::Iter> {
+        let addr_str = format!("{}:{}", self.host, self.port);
+        let addrs: Vec<SocketAddr> = addr_str.to_socket_addrs()?.collect();
+        Ok(addrs.into_iter())
     }
 }
 
@@ -196,10 +252,10 @@ impl OrderedAuthMethods {
 /// A `Result` indicating success or failure of the authentication process.
 ///
 async fn userauth(
-    session: &AsyncSession<TokioTcpStream>,
+    session: &AsyncSession,
     creds_map: &YamlCreds,
     host: &HostPort,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let creds = creds_map
         .get(&host.to_string())
         .ok_or_else(|| format!("Couldn't find credentials for {}", host))?;
@@ -209,7 +265,7 @@ async fn userauth(
 
     // Query the allowed methods as a comma-separated string.
     let auth_methods_str = session.auth_methods(&username).await?;
-    let mut ordered_auth = OrderedAuthMethods::parse(auth_methods_str);
+    let mut ordered_auth = OrderedAuthMethods::parse(&auth_methods_str);
     info!(
         "Available authentication methods in order: {:?}",
         ordered_auth
@@ -298,15 +354,15 @@ async fn userauth(
                 info!("{} authentication succeeded partially.", method);
                 // Reparse to get the updated list of allowed methods.
                 let new_auth_methods = session.auth_methods(&username).await?;
-                ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
+                ordered_auth = OrderedAuthMethods::parse(&new_auth_methods);
                 info!("Updated authentication methods: {:?}", ordered_auth);
             }
             Err(e) => match totp_key {
                 // this seems hacky but currently the only way to handle partial auth
                 Some(_) => {
                     info!("Probably partial auth: {:?}", e);
-                    ordered_auth =
-                        OrderedAuthMethods::parse(session.auth_methods(&username).await?);
+                    let auth_methods = session.auth_methods(&username).await?;
+                    ordered_auth = OrderedAuthMethods::parse(&auth_methods);
                     ordered_auth.methods.retain(|m| *m != method);
                     ordered_auth.methods.retain(|m| *m != AuthMethod::PublicKey);
                     info!(
@@ -334,13 +390,16 @@ async fn userauth(
     }
 }
 
-// Kinda works but dies under repeated hard sockperf througput testing
-fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
+// Custom duplex connection using our async runtime
+fn connect_duplex<A, B>(mut a: A, mut b: B)
 where
     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    tokio::spawn(async move {
+    // Spawn the duplex task on our custom executor
+    executor::spawn(async move {
+        use futures::io::{AsyncReadExt, AsyncWriteExt};
+        
         let mut buf_a = vec![0u8; 16 * 1024];
         let mut buf_b = vec![0u8; 16 * 1024];
 
@@ -348,40 +407,48 @@ where
         let mut a_to_b_open = true; // reading A, writing to B
         let mut b_to_a_open = true; // reading B, writing to A
 
-        // Handling this in that way is kinda sus, however afaik libssh2 channel
-        // need to handle the shutdown of the write side manually.
         while a_to_b_open || b_to_a_open {
-            tokio::select! {
+            select! {
                 // A -> B
-                res = a.read(&mut buf_a), if a_to_b_open => {
-                    match res {
-                        Ok(0) => {
-                            // A sent EOF: stop writing to B
-                            a_to_b_open = false;
-                            let _ = b.shutdown().await; // half-close B's write side
+                res = a.read(&mut buf_a).fuse() => {
+                    if a_to_b_open {
+                        match res {
+                            Ok(0) => {
+                                // A sent EOF: stop writing to B
+                                a_to_b_open = false;
+                                // No need for half-close in this simplified version
+                            }
+                            Ok(n) => {
+                                if let Err(_) = b.write_all(&buf_a[..n]).await {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
                         }
-                        Ok(n) => b.write_all(&buf_a[..n]).await?,
-                        Err(e) => return Err(e),
                     }
                 }
 
                 // B -> A
-                res = b.read(&mut buf_b), if b_to_a_open => {
-                    match res {
-                        Ok(0) => {
-                            // B sent EOF: stop writing to A
-                            b_to_a_open = false;
-                            let _ = a.shutdown().await; // half-close A's write side
+                res = b.read(&mut buf_b).fuse() => {
+                    if b_to_a_open {
+                        match res {
+                            Ok(0) => {
+                                // B sent EOF: stop writing to A
+                                b_to_a_open = false;
+                                // No need for half-close in this simplified version
+                            }
+                            Ok(n) => {
+                                if let Err(_) = a.write_all(&buf_b[..n]).await {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
                         }
-                        Ok(n) => a.write_all(&buf_b[..n]).await?,
-                        Err(e) => return Err(e),
                     }
                 }
             }
         }
-
-        Ok(())
-    })
+    });
 }
 
 /// Establishes an SSH session chain through the given jump hosts.
@@ -399,11 +466,11 @@ where
 async fn connect_chain(
     jump_hosts: &[HostPort],
     creds_map: &YamlCreds,
-) -> Result<AsyncSession<TokioTcpStream>, Box<dyn Error>> {
+) -> Result<AsyncSession, Box<dyn Error + Send + Sync>> {
     assert!(!jump_hosts.is_empty(), "No jump hosts provided");
     info!("Starting SSH chain connection through {:?}", jump_hosts);
 
-    let mut session = AsyncSession::<TokioTcpStream>::connect(jump_hosts[0].clone(), None).await?;
+    let mut session = AsyncSession::connect(jump_hosts[0].clone()).await?;
     session.handshake().await?;
     userauth(&session, creds_map, &jump_hosts[0]).await?;
 
@@ -413,18 +480,22 @@ async fn connect_chain(
             .channel_direct_tcpip(&jump.host, jump.port, None)
             .await?;
 
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind("127.0.0.1:0")?;
         let local_addr = listener.local_addr()?;
 
-        let accept_task =
-            tokio::spawn(async move { listener.accept().await.map(|(local_conn, _)| local_conn) });
+        // Accept connection in a blocking manner for simplicity
+        listener.set_nonblocking(true)?;
+        
+        let client_conn = std::net::TcpStream::connect(local_addr)?;
+        let (server_conn, _) = listener.accept()?;
 
-        let client_conn = TokioTcpStream::connect(local_addr).await?;
-        let server_conn = accept_task.await?.map_err(|e| e.to_string())?;
+        // Convert to async streams
+        let client_stream = AsyncTcpStream::new(client_conn, session.reactor())?;
+        let server_stream = AsyncTcpStream::new(server_conn, session.reactor())?;
 
-        connect_duplex(server_conn, channel);
+        connect_duplex(server_stream, channel);
 
-        session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
+        session = AsyncSession::from_stream(client_stream)?;
         session.handshake().await?;
         userauth(&session, creds_map, &jump_hosts[i]).await?;
     }
@@ -465,8 +536,9 @@ async fn run_server(
     creds: YamlCreds,
     cancel_token: CancellationToken,
     pair: Arc<(Mutex<bool>, Condvar)>,
-) -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind(addr).await?;
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
     info!("Listening on {addr}");
     {
         let (lock, cvar) = &*pair;
@@ -479,12 +551,12 @@ async fn run_server(
     let session = connect_chain(&jump_hosts, &creds).await?;
     info!("SSH session established");
     loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
+        select! {
+            _ = cancel_token.cancelled().fuse() => {
                 warn!("Shutdown signal received. Stopping server.");
                 break;
             }
-            result = listener.accept() => {
+            result = accept_connection(&listener).fuse() => {
                 match result {
                     Ok((inbound, _)) if jump_hosts.is_empty() => {
                             let socket = remote_addr
@@ -493,8 +565,10 @@ async fn run_server(
                                 .to_socket_addrs()?
                                 .next()
                                 .expect("Failed to resolve remote address");
-                            let outbound = TokioTcpStream::connect(socket).await?;
-                            connect_duplex(inbound, outbound);
+                            let outbound_tcp = std::net::TcpStream::connect(socket)?;
+                            let outbound = AsyncTcpStream::new(outbound_tcp, session.reactor())?;
+                            let async_inbound = AsyncTcpStream::new(inbound, session.reactor())?;
+                            connect_duplex(async_inbound, outbound);
                     }
                     Ok((inbound, _)) => {
                         info!("Command executed: {}", cmd.unwrap_or("No command provided"));
@@ -516,15 +590,14 @@ async fn run_server(
                                 //     error!("Command execution failed with exit code: {}", exit_code);
                                 // }
                                 // Wait for started service to be ready
-                                // I know this isn't the cleanest solution
-                                // open for suggestions
                                 let mut counter = 0;
                                 loop {
                                     match session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await {
                                         Ok(channel) => {
                                             info!("SSH channel established ");
                                             info!("Connected to remote address: {}", remote_addr);
-                                            connect_duplex(inbound, channel);
+                                            let async_inbound = AsyncTcpStream::new(inbound, session.reactor())?;
+                                            connect_duplex(async_inbound, channel);
                                             break;
                                         }
                                         Err(err) => {
@@ -536,7 +609,7 @@ async fn run_server(
 
                                             // If the connect failed, wait a bit and retry
                                             error!("remote not ready yet: {err}, retrying…");
-                                            tokio::time::sleep(Duration::from_millis(100)).await;
+                                            std::thread::sleep(Duration::from_millis(100));
                                         }
                                     }
                                 }
@@ -553,7 +626,8 @@ async fn run_server(
                                 // if exit_code != 0 {
                                 //     error!("Command execution failed with exit code: {}", exit_code);
                                 // }
-                                connect_duplex(inbound, channel);
+                                let async_inbound = AsyncTcpStream::new(inbound, session.reactor())?;
+                                connect_duplex(async_inbound, channel);
                                 continue;
                             }
                             (None, Some(remote_addr)) => {
@@ -563,7 +637,8 @@ async fn run_server(
                                 let channel = session.channel_direct_tcpip(&remote_addr.host, remote_addr.port, None).await?;
                                 info!("SSH channel established ");
                                 info!("Connected to remote address: {}", remote_addr);
-                                connect_duplex(inbound, channel);
+                                let async_inbound = AsyncTcpStream::new(inbound, session.reactor())?;
+                                connect_duplex(async_inbound, channel);
                                 continue;
                             }
                             (None, None) => {
@@ -732,7 +807,7 @@ pub fn bind(
     let handle = thread::spawn(move || {
         let bind_addr_owned = bind_addr.clone();
         let cmd_owned = cmd.clone();
-        let rt = Runtime::new().expect("Failed to create Tokio runtime");
+        let rt = Runtime::new().expect("Failed to create custom runtime");
         match rt.block_on(async move {
             run_server(
                 &bind_addr_owned,

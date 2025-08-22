@@ -56,5 +56,10 @@ name = "integration_test_runner"
 path = "tests/integration_test_runner.rs"
 required-features = ["tokio"]
 
+[[bin]]
+name = "ssh_test_server"
+path = "src/bin/ssh_test_server.rs"
+required-features = ["tokio"]
+
 [target.'cfg(windows)'.dependencies]
 named_pipe = "0.4.1"
