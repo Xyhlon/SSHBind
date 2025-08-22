@@ -14,7 +14,8 @@
   davidPassword = "david";
   baseNodes = {
     # We don't need to add anything to the system configuration of the machines
-    user = {...}: {
+    user = {pkgs, ...}: {
+      virtualisation.memorySize = 4096; # 4 GiB
       users.users.alice = {
         isNormalUser = true;
         useDefaultShell = true;
@@ -30,12 +31,22 @@
           btop
         ];
       };
-      environment.systemPackages = with pkgs; [
-        wrk2
-        oha
-        iperf3
-        sockperf
-      ];
+      environment.systemPackages = with pkgs;
+        [
+          wrk2
+          oha
+          iperf3
+          sockperf
+          perf-tools
+          tokio-console
+        ]
+        ++ [pkgs.linuxPackages.perf];
+      boot.kernel.sysctl = {
+        "kernel.perf_event_paranoid" = 1; # use 0 or -1 for broader access
+        "kernel.kptr_restrict" = 0; # allows resolving kernel symbols
+      };
+
+      environment.enableDebugInfo = true;
       networking = {
         hostName = "user"; # Define your hostname.
       };
@@ -315,19 +326,21 @@ in
 
       # Testing basic usage
       user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8000 -r 192.168.12.2:80 -s ~/secrets.yaml -j 192.168.10.1:22 -j 192.168.11.3:22'")
-      assert user.succeed("su -l alice -c 'curl 127.0.0.1:8000'") == "Hello from NixOS!\n", "Failed ip chain connection with remote service"
+      assert user.succeed("su -l alice -c 'curl 127.0.0.1:8000 -m 3'") == "Hello from NixOS!\n", "Failed ip chain connection with remote service"
       user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8001 -r host-target:80 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22'")
-      assert user.succeed("su -l alice -c 'curl 127.0.0.1:8001'") == "Hello from NixOS!\n", "Failed hostname chain connection with remote service"
+      assert user.succeed("su -l alice -c 'curl 127.0.0.1:8001 -m 3'") == "Hello from NixOS!\n", "Failed hostname chain connection with remote service"
       user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8002 -r 127.0.0.1:12345 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "socat TCP-LISTEN:12345,fork EXEC:cat"'""")
       assert user.succeed(r"""su -l alice -c "printf 'Hello Nixos!\n' | nc -w 3 127.0.0.1 8002" """) == "Hello Nixos!\n", "Failed hostname chain connection with remote service and command"
       user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8003 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "echo \"Hi\""'""")
       assert user.succeed(r"""su -l alice -c "nc 127.0.0.1 8003 </dev/null" """) == "Hi\n", "Failed hostname chain connection with remote service and command using internal pipe"
       user.succeed("su -l alice -c 'sshbind bind -a 127.0.0.1:8004 -r 127.0.0.1:8000 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22'")
-      assert user.succeed("su -l alice -c 'curl 127.0.0.1:8004'") == "Hello from NixOS!\n", "Failed hostname chain connection with local service"
+      assert user.succeed("su -l alice -c 'curl 127.0.0.1:8004 -m 3'") == "Hello from NixOS!\n", "Failed hostname chain connection with local service"
       # user.succeed(r"wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8000/ && wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8001/ &&  wrk2 -t4 -c200 -d10s -R 5000 --latency http://127.0.0.1:8004/")
       # user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8000")
       user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8070 -r 127.0.0.1:5201 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "iperf3 -s"'""")
       user.succeed("""su -l alice -c 'sshbind bind -a 127.0.0.1:8071 -r 127.0.0.1:11111 -s ~/secrets.yaml -j host-passwd:22 -j host-totp:22 -j host-target:22 -c "sockperf sr -i 127.0.0.1 -p 11111 --tcp"'""")
+      print(user.succeed("iperf3 -c 127.0.0.1 -p 8070"))
+      print(user.succeed("sockperf pp -i 127.0.0.1 -p 8071 -m 350 -t 30 --tcp"))
       user.send_chars("iperf3 -c 127.0.0.1 -p 8070\n")
       user.send_chars("sockperf pp -i 127.0.0.1 -p 8071 -m 350 -t 30 --tcp\n")
       print(user.succeed("cat /home/alice/.local/share/sshbind/sshbind.log"))

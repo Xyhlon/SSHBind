@@ -47,10 +47,10 @@
           enable = true;
           settings = {
             PasswordAuthentication = true;
-            MaxSessions = 20; # Allow more concurrent sessions
-            MaxStartups = "20:30:60"; # Allow more concurrent connections
-            ClientAliveInterval = 60;
-            ClientAliveCountMax = 10;
+            MaxSessions = 5; # Allow more concurrent sessions
+            # MaxStartups = "20:30:60"; # Allow more concurrent connections
+            # ClientAliveInterval = 60;
+            # ClientAliveCountMax = 10;
           };
         };
         httpd = {
