@@ -47,6 +47,7 @@ impl AsyncChannel {
     }
 
     /// Send EOF on the channel
+    #[allow(dead_code)]
     pub async fn send_eof(&mut self) -> Result<(), ssh2::Error> {
         futures::future::poll_fn(|cx| {
             let mut channel = self.inner.lock().unwrap();
@@ -65,6 +66,7 @@ impl AsyncChannel {
     }
 
     /// Wait for EOF on the channel
+    #[allow(dead_code)]
     pub async fn wait_eof(&mut self) -> Result<(), ssh2::Error> {
         futures::future::poll_fn(|cx| {
             let mut channel = self.inner.lock().unwrap();
@@ -83,6 +85,7 @@ impl AsyncChannel {
     }
 
     /// Close the channel
+    #[allow(dead_code)]
     pub async fn close(&mut self) -> Result<(), ssh2::Error> {
         futures::future::poll_fn(|cx| {
             let mut channel = self.inner.lock().unwrap();

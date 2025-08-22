@@ -23,6 +23,7 @@ pub struct AsyncSession {
 
 impl AsyncSession {
     /// Connect to SSH server at given address
+    #[allow(dead_code)]
     pub async fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let socket_addr = addr
             .to_socket_addrs()?
@@ -61,6 +62,7 @@ impl AsyncSession {
     }
 
     /// Get the reactor for spawning tasks
+    #[allow(dead_code)]
     pub fn reactor(&self) -> Arc<Reactor> {
         self.reactor.clone()
     }

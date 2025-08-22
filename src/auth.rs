@@ -237,21 +237,16 @@ pub async fn connect_chain(
     session.handshake().await?;
     userauth(&session, creds, first_host).await?;
 
-    let current_session = session;
-    
-    for host in jump_hosts.iter().skip(1) {
-        info!("Connecting through jump host to: {}", host);
-        let _channel = current_session.channel_direct_tcpip(
-            &host.host,
-            host.port,
-            None,
-        ).await?;
-        
-        // For simplicity, we'll use the same approach but this is a limitation
-        // In a full implementation, we'd need to wrap the channel as a stream
-        warn!("Multi-hop SSH not fully implemented yet");
-        break;
+    // Currently only supports single hop connections
+    // Multi-hop requires wrapping SSH channels as streams, which is complex
+    if jump_hosts.len() > 1 {
+        return Err(format!(
+            "Multi-hop SSH connections are not supported. Only single hop connections are implemented. \
+            Received {} hosts, but only the first will be used: {}",
+            jump_hosts.len(),
+            first_host
+        ).into());
     }
 
-    Ok(current_session)
+    Ok(session)
 }

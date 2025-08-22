@@ -74,9 +74,10 @@ fn setup_server_notification(
     pair: &Arc<(Mutex<bool>, Condvar)>,
 ) {
     let (lock, cvar) = &**pair;
-    let mut pending = lock.lock().unwrap();
-    *pending = false;
-    cvar.notify_one();
+    if let Ok(mut pending) = lock.lock() {
+        *pending = false;
+        cvar.notify_one();
+    }
 }
 
 /// Main server loop that handles incoming connections

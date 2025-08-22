@@ -82,7 +82,13 @@ pub fn bind(
     sopsfile: &str,
     cmd: Option<String>,
 ) {
-    let mut binds = BINDINGS.lock().unwrap();
+    let mut binds = match BINDINGS.lock() {
+        Ok(binds) => binds,
+        Err(e) => {
+            error!("Failed to acquire lock for bindings: {}", e);
+            return;
+        }
+    };
 
     if !std::path::Path::new(sopsfile).exists() {
         error!("SOPS file not found: {sopsfile}");
@@ -97,22 +103,28 @@ pub fn bind(
         }
     };
 
-    let jump_hosts: Vec<HostPort> = jump_hosts
+    let jump_hosts: Vec<HostPort> = match jump_hosts
         .iter()
         .map(|host| HostPort::try_from(host.as_str()))
         .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_else(|e| {
+    {
+        Ok(hosts) => hosts,
+        Err(e) => {
             error!("Failed to parse jump hosts: {}", e);
-            panic!("Invalid jump host, doesn't conform to URI format of RFC 3986 / RFC 7230 / RFC 9110");
-        });
+            return;
+        }
+    };
 
-    let remote_addr = remote_addr
+    let remote_addr = match remote_addr
         .map(|addr| HostPort::try_from(addr.as_str()))
         .transpose()
-        .unwrap_or_else(|e| {
+    {
+        Ok(addr) => addr,
+        Err(e) => {
             error!("Failed to parse remote address: {}", e);
-            panic!("Invalid remote address, doesn't conform to URI format of RFC 3986 / RFC 7230 / RFC 9110");
-        });
+            return;
+        }
+    };
 
     let creds: YamlCreds = match serde_yml::from_str(&decrypted_content) {
         Ok(creds) => creds,
@@ -132,30 +144,42 @@ pub fn bind(
     let handle = thread::spawn(move || {
         let bind_addr_owned = bind_addr.clone();
         let cmd_owned = cmd.clone();
-        let rt = Runtime::new().expect("Failed to create custom runtime");
-        match rt.block_on(async move {
-            run_server(
-                &bind_addr_owned,
-                jump_hosts,
-                remote_addr,
-                cmd_owned.as_deref(),
-                creds,
-                token_clone,
-                pair_clone,
-            ).await
-        }) {
-            Ok(_) => {},
-            Err(e) => error!("Server error: {e}"),
+        match Runtime::new() {
+            Ok(rt) => {
+                match rt.block_on(async move {
+                    run_server(
+                        &bind_addr_owned,
+                        jump_hosts,
+                        remote_addr,
+                        cmd_owned.as_deref(),
+                        creds,
+                        token_clone,
+                        pair_clone,
+                    ).await
+                }) {
+                    Ok(_) => {},
+                    Err(e) => error!("Server error: {e}"),
+                }
+            }
+            Err(e) => {
+                error!("Failed to create custom runtime: {e}");
+                return;
+            }
         }
     });
 
     binds.insert(addr.to_string(), (cancel_token, handle));
 
     // Wait for the thread to start up, bind and listen.
-    let (lock, cvar) = &*pair;
-    let _guard = cvar
-        .wait_while(lock.lock().unwrap(), |pending| *pending)
-        .unwrap();
+    let pair_clone = Arc::clone(&pair);
+    let (lock, cvar) = &*pair_clone;
+    if let Ok(guard) = lock.lock() {
+        if let Err(e) = cvar.wait_while(guard, |pending| *pending) {
+            error!("Error waiting for server startup: {e}");
+        }
+    } else {
+        error!("Failed to acquire lock for server startup notification");
+    };
 }
 
 
@@ -182,17 +206,23 @@ static BINDINGS: LazyLock<
 /// unbind("127.0.0.1:8000");
 /// ```
 pub fn unbind(addr: &str) {
-    let mut binds = BINDINGS.lock().unwrap();
-    if let Some((cancel_token, handle)) = binds.remove(addr) {
-        info!("Destructing binding on {}", addr);
-        info!("Signaling cancellation...");
-        cancel_token.cancel();
-        if let Err(e) = handle.join() {
-            error!("Failed to join thread for {}: {:?}", addr, e);
-        } else {
-            info!("Successfully unbound {}", addr);
+    match BINDINGS.lock() {
+        Ok(mut binds) => {
+            if let Some((cancel_token, handle)) = binds.remove(addr) {
+                info!("Destructing binding on {}", addr);
+                info!("Signaling cancellation...");
+                cancel_token.cancel();
+                if let Err(e) = handle.join() {
+                    error!("Failed to join thread for {}: {:?}", addr, e);
+                } else {
+                    info!("Successfully unbound {}", addr);
+                }
+            } else {
+                warn!("No binding found for {}", addr);
+            }
         }
-    } else {
-        warn!("No binding found for {}", addr);
+        Err(e) => {
+            error!("Failed to acquire lock for bindings: {}", e);
+        }
     }
 }

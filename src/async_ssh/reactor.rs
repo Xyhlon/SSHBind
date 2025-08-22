@@ -34,19 +34,23 @@ impl Reactor {
 
     /// Register a waker for the given token
     pub fn register_waker(&self, token: Token, waker: Waker) {
-        let mut wakers = self.wakers.lock().unwrap();
-        wakers.insert(token, waker);
+        if let Ok(mut wakers) = self.wakers.lock() {
+            wakers.insert(token, waker);
+        }
     }
 
     /// Remove waker for the given token
     pub fn remove_waker(&self, token: Token) {
-        let mut wakers = self.wakers.lock().unwrap();
-        wakers.remove(&token);
+        if let Ok(mut wakers) = self.wakers.lock() {
+            wakers.remove(&token);
+        }
     }
 
     /// Register interest in a socket for the given token
     pub fn register_socket(&self, socket: &std::net::TcpStream, token: Token) -> io::Result<()> {
         // Register for both read and write events
+        // Safety: The polling crate requires unsafe for platform compatibility,
+        // but ensures safe operation when adding valid sockets
         unsafe {
             self.poller.add(socket, Event::all(token.0))?;
         }
@@ -65,10 +69,11 @@ impl Reactor {
         let mut events = Events::new();
         self.poller.wait(&mut events, timeout)?;
 
-        let wakers = self.wakers.lock().unwrap();
-        for event in events.iter() {
-            if let Some(waker) = wakers.get(&Token(event.key)) {
-                waker.wake_by_ref();
+        if let Ok(wakers) = self.wakers.lock() {
+            for event in events.iter() {
+                if let Some(waker) = wakers.get(&Token(event.key)) {
+                    waker.wake_by_ref();
+                }
             }
         }
 
