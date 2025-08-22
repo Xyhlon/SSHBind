@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 use std::thread;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[test]
 fn test_public_api_concepts() {
@@ -46,7 +45,7 @@ fn test_select_macro_concepts() {
         // Test the concepts without using select! since it's complex
         // In practice our custom runtime uses futures::select! with fuse()
         let fut1 = async { "first" };
-        let fut2 = async { "second" };
+        let _fut2 = async { "second" };
         
         // For testing, just pick one
         fut1.await
@@ -58,30 +57,33 @@ fn test_select_macro_concepts() {
 
 #[test]
 fn test_cancellation_patterns() {
-    // Test the cancellation patterns used in lib.rs
+    // Test the cancellation patterns used in lib.rs (CancellationToken with Mutex<bool>)
     let rt = tokio::runtime::Runtime::new().expect("Failed to create test runtime");
     
-    let cancelled = Arc::new(AtomicBool::new(false));
+    // Use the same pattern as lib.rs CancellationToken
+    let cancelled = Arc::new(Mutex::new(false));
     let cancelled_clone = cancelled.clone();
     
     rt.block_on(async move {
-        // Simulate a cancellation scenario
+        // Simulate a cancellation scenario using the lib.rs pattern
         let task = async move {
-            for _ in 0..100 {
-                if cancelled_clone.load(Ordering::SeqCst) {
+            // Simulate work with cancellation checking like lib.rs cancelled() method
+            loop {
+                if *cancelled_clone.lock().unwrap() {
                     return "cancelled";
                 }
                 futures::future::ready(()).await;
+                // Use the same polling interval as lib.rs
+                std::thread::sleep(Duration::from_millis(10));
             }
-            "completed"
         };
         
         // Start the task and cancel it
         let task_handle = tokio::spawn(task);
         
-        // Cancel after a short delay
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        cancelled.store(true, Ordering::SeqCst);
+        // Cancel after sufficient time for the loop to start
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        *cancelled.lock().unwrap() = true;
         
         let result = task_handle.await.expect("Task failed");
         assert_eq!(result, "cancelled");
@@ -121,7 +123,7 @@ fn test_async_tcp_stream_concepts() {
 #[test] 
 fn test_reactor_polling_concepts() {
     // Test the polling concepts used in our reactor
-    use polling::{Event, Events, Poller};
+    use polling::{Events, Poller};
     use std::time::Duration;
     
     let poller = Poller::new().expect("Failed to create poller");

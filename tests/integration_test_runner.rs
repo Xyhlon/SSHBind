@@ -1,7 +1,5 @@
 use std::env;
 use std::process;
-use std::io::Write;
-use std::fs::File;
 
 #[tokio::main]
 async fn main() {

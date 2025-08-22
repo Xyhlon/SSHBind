@@ -53,19 +53,10 @@ impl Reactor {
         Ok(())
     }
 
-    /// Modify interest in a socket
-    pub fn modify_socket(&self, socket: &std::net::TcpStream, token: Token) -> io::Result<()> {
-        unsafe {
-            self.poller.modify(socket, Event::all(token.0))?;
-        }
-        Ok(())
-    }
 
     /// Remove socket from poller
     pub fn remove_socket(&self, socket: &std::net::TcpStream) -> io::Result<()> {
-        unsafe {
-            self.poller.delete(socket)?;
-        }
+        self.poller.delete(socket)?;
         Ok(())
     }
 
@@ -84,8 +75,4 @@ impl Reactor {
         Ok(())
     }
 
-    /// Get the underlying poller
-    pub fn poller(&self) -> &Arc<Poller> {
-        &self.poller
-    }
 }

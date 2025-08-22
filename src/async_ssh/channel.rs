@@ -118,10 +118,6 @@ impl AsyncChannel {
         }).await
     }
 
-    /// Get exit status
-    pub fn exit_status(&self) -> Option<i32> {
-        self.inner.lock().unwrap().exit_status().ok()
-    }
 }
 
 impl Drop for AsyncChannel {
@@ -183,13 +179,3 @@ impl AsyncWrite for AsyncChannel {
     }
 }
 
-// Implement tokio-style shutdown for compatibility
-impl AsyncChannel {
-    pub async fn shutdown(&mut self) -> io::Result<()> {
-        // For SSH channels, we close the write side by sending EOF
-        if let Err(e) = self.send_eof().await {
-            return Err(io::Error::new(io::ErrorKind::Other, e));
-        }
-        Ok(())
-    }
-}

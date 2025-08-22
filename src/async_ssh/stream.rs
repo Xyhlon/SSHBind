@@ -93,11 +93,3 @@ impl AsyncWrite for AsyncTcpStream {
     }
 }
 
-// Implement tokio-style shutdown for compatibility
-impl AsyncTcpStream {
-    pub async fn shutdown(&mut self) -> io::Result<()> {
-        use std::net::Shutdown;
-        self.inner.shutdown(Shutdown::Write)?;
-        Ok(())
-    }
-}

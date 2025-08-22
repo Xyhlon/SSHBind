@@ -21,14 +21,6 @@ impl Runtime {
         })
     }
 
-    /// Spawn a future on this runtime
-    pub fn spawn<F>(&self, future: F)
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
-        let mut executor = self.executor.lock().unwrap();
-        executor.spawn(future);
-    }
 
     /// Run a future to completion on this runtime
     pub fn block_on<F>(&self, future: F) -> F::Output

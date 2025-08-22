@@ -207,7 +207,7 @@ fn test_connection_without_servers() {
     let start_time = std::time::Instant::now();
     
     // Run in separate thread to avoid blocking main test thread
-    let handle = thread::spawn(move || {
+    let _handle = thread::spawn(move || {
         bind(bind_addr, jump_hosts, remote_addr, &sops_file, None);
     });
     

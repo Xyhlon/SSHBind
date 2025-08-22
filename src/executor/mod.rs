@@ -79,10 +79,6 @@ impl Executor {
         }
     }
 
-    /// Get the reactor for async operations
-    pub fn reactor(&self) -> Arc<Reactor> {
-        self.reactor.clone()
-    }
 }
 
 /// Create a dummy waker that does nothing
@@ -116,29 +112,4 @@ where
     });
 }
 
-/// Run a future to completion using a new executor
-pub fn block_on<F>(future: F) -> F::Output
-where
-    F: Future,
-{
-    let mut executor = Executor::new().expect("Failed to create executor");
-    executor.block_on(future)
-}
 
-/// Run a future to completion using the current executor if available
-pub fn run_with_executor<F>(future: F) -> F::Output
-where
-    F: Future,
-{
-    EXECUTOR.with(|executor| {
-        if let Some(ref mut exec) = *executor.borrow_mut() {
-            exec.block_on(future)
-        } else {
-            let new_executor = Executor::new().expect("Failed to create executor");
-            *executor.borrow_mut() = Some(new_executor);
-            let result = executor.borrow_mut().as_mut().unwrap().block_on(future);
-            *executor.borrow_mut() = None;
-            result
-        }
-    })
-}

@@ -1,5 +1,4 @@
 use std::process::Command;
-use std::time::Duration;
 
 /// Run a test in the isolated test runner binary
 fn run_isolated_test(test_name: &str) -> Result<(), Box<dyn std::error::Error>> {

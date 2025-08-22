@@ -1,6 +1,4 @@
 use sshbind::{HostPort, Creds, YamlCreds};
-use std::collections::BTreeMap;
-use std::str::FromStr;
 
 #[test]
 fn test_hostport_parsing() {
