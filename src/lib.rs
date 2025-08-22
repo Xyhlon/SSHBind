@@ -26,7 +26,7 @@ mod async_ssh;
 mod executor;
 mod select;
 
-use async_ssh::{AsyncSession, AsyncTcpStream, AsyncChannel};
+use async_ssh::{AsyncSession, AsyncTcpStream};
 use executor::Runtime;
 use select::select;
 

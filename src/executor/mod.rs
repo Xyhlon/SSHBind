@@ -99,8 +99,8 @@ fn dummy_waker() -> Waker {
     unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
 }
 
-/// Global executor for convenience functions
 thread_local! {
+    /// Global executor for convenience functions
     static EXECUTOR: std::cell::RefCell<Option<Executor>> = std::cell::RefCell::new(None);
 }
 
@@ -134,7 +134,7 @@ where
         if let Some(ref mut exec) = *executor.borrow_mut() {
             exec.block_on(future)
         } else {
-            let mut new_executor = Executor::new().expect("Failed to create executor");
+            let new_executor = Executor::new().expect("Failed to create executor");
             *executor.borrow_mut() = Some(new_executor);
             let result = executor.borrow_mut().as_mut().unwrap().block_on(future);
             *executor.borrow_mut() = None;

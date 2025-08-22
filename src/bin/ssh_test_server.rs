@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use tokio::task;
 use russh::server::Server;
 use log::{info, error};
 
@@ -17,7 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: {} <port> <username> [password] [totp_key]", args[0]);
-        eprintln!("Example: {} 2222 pi max");
+        eprintln!("Example: {} 2222 pi max", args[0]);
         eprintln!("Example: {} 2222 pi max GEZDGNBVGY3TQOJQ", args[0]);
         std::process::exit(1);
     }
@@ -52,7 +51,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut users = HashMap::new();
     users.insert(username, Credentials {
         password,
-        totp_key,
+        require_2fa: totp_key.is_some(),
+        two_factor_code: totp_key,
+        allowed_pubkey_base64: None,
     });
     
     let mut server = SSHServer::new(Some(users));

@@ -1,20 +1,15 @@
-use std::collections::HashMap;
-use std::future::Future;
 use std::io;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::pin::Pin;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
-use std::time::Duration;
+use std::task::Poll;
 
-use polling::{Event, Events, Poller};
-use ssh2::{Channel, Session};
+use ssh2::Session;
 
 pub mod reactor;
 mod stream;
 mod channel;
 
-use reactor::{Reactor, Token};
+use reactor::Reactor;
 
 pub use channel::AsyncChannel;
 pub use stream::AsyncTcpStream;
