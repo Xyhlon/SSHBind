@@ -17,12 +17,12 @@ use std::fs::File;
 use std::io::BufReader;
 use std::time::Duration;
 
+use async_channel::{Receiver, Sender};
 use async_executor::{Executor, Task};
-use async_io::Async;
+use async_io::{Async, Timer};
 use futures::future::FutureExt;
 use futures::{select, AsyncReadExt, AsyncWriteExt};
 use std::net::{TcpListener as StdTcpListener, TcpStream};
-use async_channel::{Sender, Receiver};
 
 #[cfg(not(unix))]
 use async_io::Async as AsyncTcpListener;
@@ -342,74 +342,6 @@ async fn userauth(
     }
 }
 
-// Generic bidirectional copy function using futures select pattern (matching proxy_jump demo)
-fn connect_duplex<A, B>(
-    ex: Arc<Executor<'_>>,
-    mut a: A,
-    mut b: B,
-    _cancel_rx: Receiver<()>,
-) -> Task<std::io::Result<()>>
-where
-    A: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
-    B: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
-{
-    ex.spawn(async move {
-        info!("Data forwarding task starting");
-
-        let mut buf_a = vec![0; 2048];
-        let mut buf_b = vec![0; 2048];
-
-        loop {
-            select! {
-                ret_a = a.read(&mut buf_a).fuse() => match ret_a {
-                    Ok(0) => {
-                        info!("Connection A read 0");
-                        break;
-                    },
-                    Ok(n) => {
-                        info!("Connection A read {}", n);
-                        if let Err(err) = b.write_all(&buf_a[..n]).await {
-                            if err.kind() != std::io::ErrorKind::BrokenPipe {
-                                error!("Write to B failed: {:?}", err);
-                            }
-                            break;
-                        }
-                    },
-                    Err(err) => {
-                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
-                            error!("Read from A failed: {:?}", err);
-                        }
-                        break;
-                    }
-                },
-                ret_b = b.read(&mut buf_b).fuse() => match ret_b {
-                    Ok(0) => {
-                        info!("Connection B read 0");
-                        break;
-                    },
-                    Ok(n) => {
-                        info!("Connection B read {}", n);
-                        if let Err(err) = a.write_all(&buf_b[..n]).await {
-                            if err.kind() != std::io::ErrorKind::BrokenPipe {
-                                error!("Write to A failed: {:?}", err);
-                            }
-                            break;
-                        }
-                    },
-                    Err(err) => {
-                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
-                            error!("Read from B failed: {:?}", err);
-                        }
-                        break;
-                    }
-                },
-            }
-        }
-
-        Ok(())
-    })
-}
-
 // Special version for chain connections (matching proxy_jump demo)
 fn connect_chain_tunnel<A, B>(
     ex: Arc<Executor<'_>>,
@@ -424,52 +356,51 @@ where
     ex.spawn(async move {
         info!("Bridge task starting");
 
-        let mut buf_a = vec![0; 2048];
-        let mut buf_b = vec![0; 2048];
+        // Use moderate buffers - too large can cause issues with SSH channels
+        let mut buf_a = vec![0; 16 * 1024];
+        let mut buf_b = vec![0; 16 * 1024];
 
         loop {
             select! {
                 ret_a = a.read(&mut buf_a).fuse() => match ret_a {
-                    Ok(0) => {
-                        info!("Bridge connection A read 0");
-                        break;
-                    },
-                    Ok(n) => {
-                        info!("Bridge connection A read {}", n);
-                        if let Err(err) = b.write_all(&buf_a[..n]).await {
-                            if err.kind() != std::io::ErrorKind::BrokenPipe {
-                                error!("Bridge write to B failed: {:?}", err);
+                        Ok(0) => {
+                            info!("Bridge connection A read 0");
+                            break;
+                        },
+                        Ok(n) => {
+                            if let Err(err) = b.write_all(&buf_a[..n]).await {
+                                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                    error!("Bridge write to B failed: {:?}", err);
+                                }
+                                break;
+                            }
+                        },
+                        Err(err) => {
+                            if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                                error!("Bridge read from A failed: {:?}", err);
                             }
                             break;
                         }
-                    },
-                    Err(err) => {
-                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
-                            error!("Bridge read from A failed: {:?}", err);
-                        }
-                        break;
-                    }
                 },
                 ret_b = b.read(&mut buf_b).fuse() => match ret_b {
-                    Ok(0) => {
-                        info!("Bridge connection B read 0");
-                        break;
-                    },
-                    Ok(n) => {
-                        info!("Bridge connection B read {}", n);
-                        if let Err(err) = a.write_all(&buf_b[..n]).await {
-                            if err.kind() != std::io::ErrorKind::BrokenPipe {
-                                error!("Bridge write to A failed: {:?}", err);
+                        Ok(0) => {
+                            info!("Bridge connection B read 0");
+                            break;
+                        },
+                        Ok(n) => {
+                            if let Err(err) = a.write_all(&buf_b[..n]).await {
+                                if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                    error!("Bridge write to A failed: {:?}", err);
+                                }
+                                break;
+                            }
+                        },
+                        Err(err) => {
+                            if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                                error!("Bridge read from B failed: {:?}", err);
                             }
                             break;
                         }
-                    },
-                    Err(err) => {
-                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
-                            error!("Bridge read from B failed: {:?}", err);
-                        }
-                        break;
-                    }
                 },
             }
         }
@@ -477,163 +408,6 @@ where
         Ok(())
     })
 }
-
-// fn connect_duplex<A, B>(
-//     mut a: A,
-//     mut b: async_ssh2_lite::AsyncChannel<B>,
-// ) -> tokio::task::JoinHandle<tokio::io::Result<()>>
-// where
-//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-// {
-//     tokio::spawn(async move {
-//         let mut buf_a = vec![0u8; 16 * 1024];
-//         let mut buf_b = vec![0u8; 16 * 1024];
-//
-//         // Track whether each *direction* is still open:
-//         let mut a_to_b_open = true; // reading A, writing to B
-//         let mut b_to_a_open = true; // reading B, writing to A
-//
-//         // Handling this in that way is kinda sus, however afaik libssh2 channel
-//         // need to handle the shutdown of the write side manually.
-//         while a_to_b_open || b_to_a_open {
-//             tokio::select! {
-//                 // A -> B
-//                 res = a.read(&mut buf_a), if a_to_b_open => {
-//                     match res {
-//                         Ok(0) => {
-//                             // A sent EOF: stop writing to B
-//                             a_to_b_open = false;
-//
-//                         }
-//                         Ok(n) => b.write_all(&buf_a[..n]).await?,
-//                         Err(e) => return Err(e),
-//                     }
-//                 }
-//
-//                 // B -> A
-//                 res = b.read(&mut buf_b), if b_to_a_open => {
-//                     match res {
-//                         Ok(0) => {
-//                             // B sent EOF: stop writing to A
-//                             b_to_a_open = false;
-//                             let _ = a.shutdown().await; // half-close A's write side
-//                         }
-//                         Ok(n) => a.write_all(&buf_b[..n]).await?,
-//                         Err(e) => return Err(e),
-//                     }
-//                 }
-//             }
-//         }
-//
-//         Ok(())
-//     })
-// }
-
-// Doesn't really work but it is the recommended way for forwarding the stream
-// https://github.com/bk-rs/ssh-rs/blob/main/async-ssh2-lite/demos/smol/src/proxy_jump.rs
-// Dies with simple iperf3 test
-// fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
-// where
-//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-// {
-//     tokio::spawn(async move {
-//         let mut buf_bastion_channel = vec![0; 16 * 2048];
-//         let mut buf_forward_stream_r = vec![0; 16 * 2048];
-//
-//         loop {
-//             tokio::select! {
-//                 ret_forward_stream_r = a.read(&mut buf_forward_stream_r) => match ret_forward_stream_r {
-//                     Ok(0) => {
-//                         break
-//                     },
-//                     Ok(n) => {
-//                         b.write(&buf_forward_stream_r[..n]).await.map(|_| ()).map_err(|err| {
-//                             eprintln!("bastion_channel write failed, err:{err:?}");
-//                             err
-//                         })?
-//                     },
-//                     Err(err) =>  {
-//                         eprintln!("forward_stream_r read failed, err:{err:?}");
-//
-//                         return Err(err);
-//                     }
-//                 },
-//                 ret_bastion_channel = b.read(&mut buf_bastion_channel) => match ret_bastion_channel {
-//                     Ok(0) => {
-//                         break
-//                     },
-//                     Ok(n) => {
-//                         a.write(&buf_bastion_channel[..n]).await.map(|_| ()).map_err(|err| {
-//                             eprintln!("forward_stream_r write failed, err:{err:?}");
-//                             err
-//                         })?
-//                     },
-//                     Err(err) => {
-//                         eprintln!("bastion_channel read failed, err:{err:?}");
-//
-//                         return Err(err);
-//                     }
-//                 },
-//             }
-//         }
-//
-//         Ok(())
-//     })
-// }
-
-// fn connect_duplex<A, B>(mut a: A, mut b: B) -> tokio::task::JoinHandle<tokio::io::Result<()>>
-// where
-//     A: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-//     B: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-// {
-//     tokio::spawn(async move {
-//         // big-ish buffers are fine; throughput tools benefit
-//         let mut ab = vec![0u8; 1024];
-//         let mut ba = vec![0u8; 1024];
-//
-//         // track if each direction is still flowing
-//         let mut ab_open = true;
-//         let mut ba_open = true;
-//
-//         loop {
-//             if !ab_open && !ba_open {
-//                 break;
-//             }
-//
-//             tokio::select! {
-//                 // A -> B
-//                 res = a.read(&mut ab), if ab_open => {
-//                     match res {
-//                         Ok(0) => {
-//                             // DON'T call shutdown() here; just stop this direction.
-//                             ab_open = false;
-//                         }
-//                         Ok(n) => b.write_all(&ab[..n]).await?,
-//                         Err(e) => return Err(e),
-//                     }
-//                 }
-//
-//                 // B -> A
-//                 res = b.read(&mut ba), if ba_open => {
-//                     match res {
-//                         Ok(0) => {
-//                             // DON'T call shutdown() here either.
-//                             ba_open = false;
-//                         }
-//                         Ok(n) => a.write_all(&ba[..n]).await?,
-//                         Err(e) => return Err(e),
-//                     }
-//                 }
-//             }
-//         }
-//
-//         // Exiting the task drops both `a` and `b`. That closes cleanly
-//         // without breaking async-ssh2-lite's "read may need write" invariant.
-//         Ok(())
-//     })
-// }
 
 /// Establishes an SSH session chain through the given jump hosts.
 ///
@@ -673,9 +447,8 @@ async fn connect_chain(
         let local_addr = listener.get_ref().local_addr()?;
         info!("Local bridge listening on {}", local_addr);
 
-        let accept_task = ex.spawn(async move {
-            listener.accept().await.map(|(local_conn, _)| local_conn)
-        });
+        let accept_task =
+            ex.spawn(async move { listener.accept().await.map(|(local_conn, _)| local_conn) });
 
         let client_conn = AsyncTcpStream::connect(local_addr).await?;
         let server_conn = accept_task.await.map_err(|e| e.to_string())?;
@@ -685,7 +458,7 @@ async fn connect_chain(
         connect_chain_tunnel(ex.clone(), server_conn, channel, bridge_rx).detach();
 
         // Give the bridge task a moment to start
-        std::thread::sleep(Duration::from_millis(10));
+        Timer::after(Duration::from_millis(10)).await;
 
         session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
         session.handshake().await?;
@@ -716,7 +489,7 @@ where
             .expect("Failed to resolve remote address");
         let outbound = AsyncTcpStream::connect(socket).await?;
 
-        connect_duplex(ex, inbound, outbound, cancel_rx).detach();
+        connect_chain_tunnel(ex, inbound, outbound, cancel_rx).detach();
         // tokio::spawn(async move {
         //     let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
         // });
@@ -731,19 +504,11 @@ where
                 info!("SSH channel established ");
                 channel.exec(cmd).await?;
 
-                // let _ = channel.send_eof().await;
-                // let _ = channel.wait_eof().await;
-                // let _ = channel.close().await;
-                // let _ = channel.wait_close().await;
-                // let exit_code = channel.exit_status().expect("Failed to get exit code");
-                // if exit_code != 0 {
-                //     error!("Command execution failed with exit code: {}", exit_code);
-                // }
                 // Wait for started service to be ready
                 // I know this isn't the cleanest solution
                 // open for suggestions
                 let mut counter = 0;
-                std::thread::sleep(Duration::from_millis(500));
+                // Use async sleep instead of blocking thread::sleep - increase for iperf3
                 loop {
                     match session
                         .channel_direct_tcpip(&remote_addr.host, remote_addr.port, None)
@@ -752,7 +517,7 @@ where
                         Ok(channel) => {
                             info!("SSH channel established ");
                             info!("Connected to remote address: {}", remote_addr);
-                            connect_duplex(ex.clone(), inbound, channel, cancel_rx).detach();
+                            connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
                             break;
                         }
                         Err(err) => {
@@ -765,7 +530,7 @@ where
                             // Exponential backoff for high concurrency
                             let delay = 50;
                             error!("remote not ready yet: {err}, retrying in {}ms…", delay);
-                            std::thread::sleep(Duration::from_millis(delay));
+                            Timer::after(Duration::from_millis(delay)).await;
                         }
                     }
                 }
@@ -782,7 +547,7 @@ where
                 // if exit_code != 0 {
                 //     error!("Command execution failed with exit code: {}", exit_code);
                 // }
-                connect_duplex(ex.clone(), inbound, channel, cancel_rx).detach();
+                connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
             }
             (None, Some(remote_addr)) => {
                 // It is assumed that after the jumping through the
@@ -795,7 +560,7 @@ where
                     Ok(channel) => {
                         info!("SSH channel established ");
                         info!("Connected to remote address: {}", remote_addr);
-                        connect_duplex(ex.clone(), inbound, channel, cancel_rx).detach();
+                        connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
                     }
                     Err(err) => return Err(err.into()),
                 }
@@ -1073,7 +838,9 @@ pub fn bind(
                         creds,
                         cancel_rx,
                         pair_clone,
-                    ).await {
+                    )
+                    .await
+                    {
                         error!("Server error: {e}");
                     }
 
@@ -1106,9 +873,8 @@ pub struct Creds {
 }
 
 #[allow(clippy::type_complexity)]
-static BINDINGS: LazyLock<
-    Mutex<HashMap<String, (Sender<()>, std::thread::JoinHandle<()>)>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static BINDINGS: LazyLock<Mutex<HashMap<String, (Sender<()>, std::thread::JoinHandle<()>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Unbinds a previously established binding for the given address.
 ///

@@ -14,12 +14,21 @@ documentation = "https://docs.rs/sshbind"
 
 [dependencies]
 # Using forked version that removes the problematic assertions
-async-ssh2-lite = { git = "https://github.com/krystophny/ssh-rs", branch = "main", features = [
-  "tokio",
+async-ssh2-lite = { git = "https://github.com/krystophny/ssh-rs", branch = "fix-multichannel-assertions", features = [
+  "async-io",
 ] }
+# async-ssh2-lite = { git = "https://github.com/krystophny/ssh-rs", rev = "b50e0bcb1a85215c6328bfed1df13038359818fc", features = [
+#   "tokio",
+# ] }
+async-channel = "2.3.2"
+async-executor = "1.13.1"
+async-io = "2.5.0"
+cfg-if = "1.0.0"
 clap = { version = "4.5.32", features = ["derive"] }
 dirs = "6.0.0"
+easy-parallel = "3.3.1"
 env_logger = "0.11.6"
+futures = "0.3.31"
 interprocess = "2.2.3"
 libreauth = "0.17.0"
 log = "0.4.26"
@@ -29,8 +38,7 @@ serde_json = "1.0.140"
 serde_yml = "0.0.12"
 shared_memory = "0.12.4"
 ssh2-config = "0.5.4"
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7.13"
+tempfile = "3.17.1"
 url = "2.5.4"
 
 [dev-dependencies]
