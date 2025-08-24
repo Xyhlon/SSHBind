@@ -47,7 +47,7 @@
           enable = true;
           settings = {
             PasswordAuthentication = true;
-            MaxSessions = 20; # Allow more concurrent sessions
+            MaxSessions = 30; # Allow more concurrent sessions
             MaxStartups = "20:30:60"; # Allow more concurrent connections
             ClientAliveInterval = 60;
             ClientAliveCountMax = 10;
@@ -134,7 +134,7 @@ in
       user.send_chars("alice\n")
 
 
-      # Testing basic cli usage
+      # # Testing basic cli usage
       user.succeed("su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8000 -r 127.0.0.1:80 -j target:22 -s ~/secrets.yaml'")
       user.succeed("su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8001 -r 127.0.0.1:80 -j target:22 -s ~/secrets.yaml'")
       user.succeed("su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8002 -r 127.0.0.1:8000 -j target:22 -s ~/secrets.yaml'")
@@ -142,17 +142,17 @@ in
       user.succeed(r"""su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8004 -r 127.0.0.1:11111 -j target:22 -s ~/secrets.yaml -c "sockperf sr -i 127.0.0.1 -p 11111 --tcp"'""")
       user.succeed(r"""su -l alice -c 'RUST_BACKTRACE=full sshbind bind -a 127.0.0.1:8005 -r 127.0.0.1:5201 -j target:22 -s ~/secrets.yaml -c "iperf3 -s"'""")
 
-      user.send_chars("iperf3 -c 127.0.0.1 -p 8005 \n")
-      # print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8000"))
-      # print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8001"))
-      # print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8002"))
-      # print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8003"))
+      # user.send_chars("iperf3 -c 127.0.0.1 -p 8005 \n")
+      print(user.succeed("sockperf pp -i 127.0.0.1 -p 8004 -m 350 -t 30 --tcp"))
+      print(user.succeed("sockperf ul -i 127.0.0.1 -p 8004 -m 200 -t 30 --mps 100000 --tcp"))
+      print(user.succeed("sockperf tp -i 127.0.0.1 -p 8004 -m 1400 -t 15 --tcp"))
+      print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8000"))
+      print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8001"))
+      print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8002"))
+      print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8003"))
       # user.send_chars("btop\n")
       # print(user.succeed("cat /home/alice/.local/share/sshbind/sshbind_*"))
 
-      # user.succeed("sockperf pp -i 127.0.0.1 -p 8004 -m 350 -t 30 --tcp")
-      # user.succeed("sockperf ul -i 127.0.0.1 -p 8004 -m 200 -t 30 --mps 100000 --tcp")
-      # user.succeed("sockperf tp -i 127.0.0.1 -p 8004 -m 1400 -t 15 --tcp")
 
     '';
   }
