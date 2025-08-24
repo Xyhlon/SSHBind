@@ -14,7 +14,7 @@ documentation = "https://docs.rs/sshbind"
 
 [dependencies]
 # Using forked version that removes the problematic assertions
-async-ssh2-lite = { git = "https://github.com/krystophny/ssh-rs", branch = "fix-multichannel-assertions", features = [
+async-ssh2-lite = { git = "https://github.com/bk-rs/ssh-rs", branch = "main", features = [
   "async-io",
 ] }
 # async-ssh2-lite = { git = "https://github.com/krystophny/ssh-rs", rev = "b50e0bcb1a85215c6328bfed1df13038359818fc", features = [
@@ -23,12 +23,16 @@ async-ssh2-lite = { git = "https://github.com/krystophny/ssh-rs", branch = "fix-
 async-channel = "2.3.2"
 async-executor = "1.13.1"
 async-io = "2.5.0"
+# async-ssh2-lite = { version = "0.5.0", features = [
+#   "async-io",
+# ] }
 cfg-if = "1.0.0"
 clap = { version = "4.5.32", features = ["derive"] }
 dirs = "6.0.0"
 easy-parallel = "3.3.1"
 env_logger = "0.11.6"
 futures = "0.3.31"
+futures-lite = "2.3.0"
 interprocess = "2.2.3"
 libreauth = "0.17.0"
 log = "0.4.26"
