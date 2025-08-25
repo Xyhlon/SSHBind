@@ -19,9 +19,11 @@ use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use async_executor::{Executor, Task};
-use async_io::{Async, Timer};
+use async_io::Timer;
+use async_ssh2_lite::async_io::Async;
 use futures::future::FutureExt;
 use futures::{select, AsyncReadExt, AsyncWriteExt};
+// use futures_lite::future;
 use std::net::{TcpListener as StdTcpListener, TcpStream};
 
 #[cfg(not(unix))]
@@ -342,7 +344,6 @@ async fn userauth(
     }
 }
 
-// Special version for chain connections (matching proxy_jump demo)
 fn connect_chain_tunnel<A, B>(
     ex: Arc<Executor<'_>>,
     mut a: A,
@@ -356,51 +357,50 @@ where
     ex.spawn(async move {
         info!("Bridge task starting");
 
-        // Use moderate buffers - too large can cause issues with SSH channels
         let mut buf_a = vec![0; 16 * 1024];
         let mut buf_b = vec![0; 16 * 1024];
 
         loop {
             select! {
                 ret_a = a.read(&mut buf_a).fuse() => match ret_a {
-                        Ok(0) => {
-                            info!("Bridge connection A read 0");
-                            break;
-                        },
-                        Ok(n) => {
-                            if let Err(err) = b.write_all(&buf_a[..n]).await {
-                                if err.kind() != std::io::ErrorKind::BrokenPipe {
-                                    error!("Bridge write to B failed: {:?}", err);
-                                }
-                                break;
-                            }
-                        },
-                        Err(err) => {
-                            if err.kind() != std::io::ErrorKind::UnexpectedEof {
-                                error!("Bridge read from A failed: {:?}", err);
+                    Ok(0) => {
+                        info!("Bridge connection A read 0");
+                        break;
+                    },
+                    Ok(n) => {
+                        if let Err(err) = b.write_all(&buf_a[..n]).await {
+                            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                error!("Bridge write to B failed: {:?}", err);
                             }
                             break;
                         }
+                    },
+                    Err(err) => {
+                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                            error!("Bridge read from A failed: {:?}", err);
+                        }
+                        break;
+                    }
                 },
                 ret_b = b.read(&mut buf_b).fuse() => match ret_b {
-                        Ok(0) => {
-                            info!("Bridge connection B read 0");
-                            break;
-                        },
-                        Ok(n) => {
-                            if let Err(err) = a.write_all(&buf_b[..n]).await {
-                                if err.kind() != std::io::ErrorKind::BrokenPipe {
-                                    error!("Bridge write to A failed: {:?}", err);
-                                }
-                                break;
-                            }
-                        },
-                        Err(err) => {
-                            if err.kind() != std::io::ErrorKind::UnexpectedEof {
-                                error!("Bridge read from B failed: {:?}", err);
+                    Ok(0) => {
+                        info!("Bridge connection B read 0");
+                        break;
+                    },
+                    Ok(n) => {
+                        if let Err(err) = a.write_all(&buf_b[..n]).await {
+                            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                error!("Bridge write to A failed: {:?}", err);
                             }
                             break;
                         }
+                    },
+                    Err(err) => {
+                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                            error!("Bridge read from B failed: {:?}", err);
+                        }
+                        break;
+                    }
                 },
             }
         }
@@ -421,6 +421,98 @@ where
 /// A `Result` containing the final `AsyncSession` connected to the last host in the chain,
 /// or an error if the connection fails.
 ///
+type SharedSession = Arc<Mutex<Option<AsyncSession<AsyncTcpStream>>>>;
+type FailureCounter = Arc<Mutex<u32>>;
+
+async fn cleanup_session(shared_session: &SharedSession) -> Result<(), Box<dyn Error>> {
+    info!("Starting session cleanup");
+    let session_opt = {
+        let mut session_guard = shared_session.lock().unwrap();
+        session_guard.take()
+    };
+
+    if let Some(session) = session_opt {
+        info!("Disconnecting existing session");
+        let _ = session
+            .disconnect(None, "Session healing - cleaning up old session", None)
+            .await;
+    }
+    info!("Session cleanup completed");
+    Ok(())
+}
+
+async fn rebuild_session(
+    shared_session: &SharedSession,
+    ex: Arc<Executor<'_>>,
+    jump_hosts: &[HostPort],
+    creds_map: &YamlCreds,
+    cancel_tx: Sender<()>,
+) -> Result<(), Box<dyn Error>> {
+    info!("Starting session rebuild");
+
+    cleanup_session(shared_session).await?;
+
+    let new_session = connect_chain(ex, jump_hosts, creds_map, cancel_tx).await?;
+
+    {
+        let mut session_guard = shared_session.lock().unwrap();
+        *session_guard = Some(new_session);
+    }
+
+    info!("Session rebuild completed successfully");
+    Ok(())
+}
+
+async fn heal_session_with_retry(
+    shared_session: &SharedSession,
+    ex: Arc<Executor<'_>>,
+    jump_hosts: &[HostPort],
+    creds_map: &YamlCreds,
+    cancel_tx: Sender<()>,
+    max_attempts: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut attempt = 1;
+
+    while attempt <= max_attempts {
+        info!("Session healing attempt {} of {}", attempt, max_attempts);
+
+        let error_msg = match rebuild_session(
+            shared_session,
+            ex.clone(),
+            jump_hosts,
+            creds_map,
+            cancel_tx.clone(),
+        )
+        .await
+        {
+            Ok(_) => {
+                info!("Session healing successful after {} attempt(s)", attempt);
+                return Ok(());
+            }
+            Err(e) => e.to_string(),
+        };
+
+        error!("Session healing attempt {} failed: {}", attempt, error_msg);
+
+        if attempt == max_attempts {
+            error!("All session healing attempts exhausted");
+            return Err(format!(
+                "Session healing failed after {} attempts: {}",
+                max_attempts, error_msg
+            )
+            .into());
+        }
+
+        let delay_ms = std::cmp::min(1000 * (1 << (attempt - 1)), 30000);
+        warn!("Retrying session healing in {}ms", delay_ms);
+        Timer::after(Duration::from_millis(delay_ms)).await;
+
+        attempt += 1;
+    }
+
+    Err("Unexpected end of session healing retry loop".into())
+}
+
 async fn connect_chain(
     ex: Arc<Executor<'_>>,
     jump_hosts: &[HostPort],
@@ -458,7 +550,7 @@ async fn connect_chain(
         connect_chain_tunnel(ex.clone(), server_conn, channel, bridge_rx).detach();
 
         // Give the bridge task a moment to start
-        Timer::after(Duration::from_millis(10)).await;
+        Timer::after(Duration::from_millis(100)).await;
 
         session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
         session.handshake().await?;
@@ -468,7 +560,138 @@ async fn connect_chain(
     Ok(session)
 }
 
-async fn connect_to_tunnel<S>(
+fn should_trigger_session_healing(error: &dyn Error) -> bool {
+    let error_str = error.to_string().to_lowercase();
+    error_str.contains("channel session")
+        || error_str.contains("connection reset")
+        || error_str.contains("broken pipe")
+        || error_str.contains("not authenticated")
+        || error_str.contains("session closed")
+        || error_str.contains("ssh disconnect")
+        || error_str.contains("transport read")
+        || error_str.contains("unable to send channel-open request")
+        || error_str.contains("channel open fail")
+        || error_str.contains("session(-7)")
+        || error_str.contains("would block")
+}
+
+async fn is_session_healthy(session: &AsyncSession<AsyncTcpStream>) -> bool {
+    // Try to create a simple channel to test if the session is still working
+    match session.channel_session().await {
+        Ok(mut channel) => {
+            // Close the channel properly
+            let _ = channel.close().await;
+            let _ = channel.wait_close().await;
+            true
+        }
+        Err(e) => {
+            warn!("Session health check failed: {}", e);
+            false
+        }
+    }
+}
+
+async fn connect_to_tunnel(
+    ex: Arc<Executor<'_>>,
+    inbound: AsyncTcpStream,
+    shared_session: SharedSession,
+    jump_hosts: &[HostPort],
+    remote_addr: Option<&HostPort>,
+    cmd: Option<&str>,
+    cancel_rx: Receiver<()>,
+    failure_counter: FailureCounter,
+    creds_map: &YamlCreds,
+    tunnel_cancel_tx: Sender<()>,
+) -> Result<(), Box<dyn Error>> {
+    let session = {
+        let session_guard = shared_session.lock().unwrap();
+        match &*session_guard {
+            Some(session) => session.clone(),
+            None => {
+                error!("No active session available");
+                return Err("No active session available".into());
+            }
+        }
+    };
+
+    let (connection_success, should_heal, current_failures, error_msg_opt) =
+        match connect_to_tunnel_inner(
+            ex.clone(),
+            inbound,
+            session,
+            jump_hosts,
+            remote_addr,
+            cmd,
+            cancel_rx,
+        )
+        .await
+        {
+            Ok(_) => {
+                // Reset failure counter on successful connection
+                let mut counter = failure_counter.lock().unwrap();
+                *counter = 0;
+                (true, false, 0, None)
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                let is_healable = should_trigger_session_healing(&*e);
+
+                if is_healable {
+                    warn!("Connection failed with healable error: {}", error_str);
+
+                    // Increment failure counter
+                    let current_failures = {
+                        let mut counter = failure_counter.lock().unwrap();
+                        *counter += 1;
+                        *counter
+                    };
+                    (false, true, current_failures, Some(error_str))
+                } else {
+                    // Reset failure counter for non-healable errors
+                    let mut counter = failure_counter.lock().unwrap();
+                    *counter = 0;
+                    (false, false, 0, Some(error_str))
+                }
+            }
+        };
+
+    // Handle healing outside the match to avoid Send issues
+    if should_heal && current_failures >= 2 {
+        warn!(
+            "Multiple connection failures detected ({}), triggering immediate session healing",
+            current_failures
+        );
+
+        if let Err(heal_error) = heal_session_with_retry(
+            &shared_session,
+            ex.clone(),
+            jump_hosts,
+            creds_map,
+            tunnel_cancel_tx.clone(),
+            3,
+        )
+        .await
+        {
+            let heal_error_str = heal_error.to_string();
+            error!("Immediate session healing failed: {}", heal_error_str);
+        } else {
+            // Reset failure counter on successful healing
+            let mut counter = failure_counter.lock().unwrap();
+            *counter = 0;
+            info!("Session healing completed, failure counter reset");
+        }
+    }
+
+    if connection_success {
+        Ok(())
+    } else {
+        Err(error_msg_opt
+            .unwrap_or_else(|| "Unknown connection error".to_string())
+            .into())
+    }
+}
+
+async fn connect_to_tunnel_inner<S>(
     ex: Arc<Executor<'_>>,
     inbound: AsyncTcpStream,
     session: AsyncSession<S>,
@@ -528,7 +751,7 @@ where
                             counter += 1;
 
                             // Exponential backoff for high concurrency
-                            let delay = 50;
+                            let delay = 5 * counter;
                             error!("remote not ready yet: {err}, retrying in {}ms…", delay);
                             Timer::after(Duration::from_millis(delay)).await;
                         }
@@ -620,8 +843,89 @@ async fn run_server(
     }
     let remote_addr = remote_addr.as_ref();
     let (tunnel_cancel_tx, tunnel_cancel_rx) = async_channel::unbounded();
-    let session = connect_chain(ex.clone(), &jump_hosts, &creds, tunnel_cancel_tx.clone()).await?;
+    let initial_session =
+        connect_chain(ex.clone(), &jump_hosts, &creds, tunnel_cancel_tx.clone()).await?;
+    let shared_session: SharedSession = Arc::new(Mutex::new(Some(initial_session)));
+    let failure_counter: FailureCounter = Arc::new(Mutex::new(0));
     info!("SSH session established");
+
+    // Start session health monitor
+    let session_monitor = {
+        let shared_session_clone = shared_session.clone();
+        let failure_counter_clone = failure_counter.clone();
+        let ex_clone = ex.clone();
+        let jump_hosts_clone = jump_hosts.clone();
+        let creds_clone = creds.clone();
+        let tunnel_cancel_tx_clone = tunnel_cancel_tx.clone();
+
+        ex.spawn(async move {
+            let mut healing_in_progress = false;
+            let mut consecutive_failures = 0u32;
+
+            loop {
+                Timer::after(Duration::from_secs(30)).await;
+
+                if healing_in_progress {
+                    continue;
+                }
+
+                let session_healthy = {
+                    let session_opt = {
+                        let session_guard = shared_session_clone.lock().unwrap();
+                        session_guard.clone()
+                    };
+
+                    match session_opt {
+                        Some(session) => is_session_healthy(&session).await,
+                        None => false,
+                    }
+                };
+
+                if !session_healthy && !healing_in_progress {
+                    healing_in_progress = true;
+                    consecutive_failures += 1;
+
+                    warn!(
+                        "Session health check failed, attempting healing (failure #{})",
+                        consecutive_failures
+                    );
+
+                    match heal_session_with_retry(
+                        &shared_session_clone,
+                        ex_clone.clone(),
+                        &jump_hosts_clone,
+                        &creds_clone,
+                        tunnel_cancel_tx_clone.clone(),
+                        3,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            info!("Session health monitor: healing successful");
+                            consecutive_failures = 0;
+                        }
+                        Err(e) => {
+                            error!("Session health monitor: healing failed: {}", e);
+                        }
+                    }
+
+                    healing_in_progress = false;
+                } else {
+                    consecutive_failures = 0;
+                    // Decay the failure counter over time if session is healthy
+                    let mut counter = failure_counter_clone.lock().unwrap();
+                    if *counter > 0 {
+                        *counter = (*counter).saturating_sub(1);
+                        if *counter == 0 {
+                            info!(
+                                "Failure counter decayed to 0, connection issues may be resolved"
+                            );
+                        }
+                    }
+                }
+            }
+        })
+    };
     loop {
         select! {
             _ = cancel_rx.recv().fuse() => {
@@ -638,38 +942,43 @@ async fn run_server(
                 };
 
                 // Handle each connection in a separate task
-                let session_clone = session.clone();
+                let shared_session_clone = shared_session.clone();
+                let failure_counter_clone = failure_counter.clone();
                 let jump_hosts_clone = jump_hosts.clone();
                 let remote_addr_clone = remote_addr.cloned();
                 let cmd_clone = cmd.map(|s| s.to_string());
                 let tunnel_rx = tunnel_cancel_rx.clone();
                 let ex_clone = ex.clone();
+                let creds_clone = creds.clone();
+                let tunnel_cancel_tx_clone = tunnel_cancel_tx.clone();
 
                 ex.spawn(async move {
                     match connect_to_tunnel(
                         ex_clone,
                         sock,
-                        session_clone,
+                        shared_session_clone,
                         &jump_hosts_clone,
                         remote_addr_clone.as_ref(),
                         cmd_clone.as_deref(),
                         tunnel_rx,
+                        failure_counter_clone,
+                        &creds_clone,
+                        tunnel_cancel_tx_clone,
                     ).await {
                         Ok(_) => {
                             info!("Connection handled successfully");
                         }
                         Err(e) => {
                             error!("Failed to handle connection: {e}");
-                            // Note: Session rebuild should be handled at a higher level
                         }
                     }
                 }).detach();
             }
         }
     }
-    session
-        .disconnect(None, "Closing Session caused by unbind request", None)
-        .await?;
+
+    session_monitor.cancel().await;
+    cleanup_session(&shared_session).await?;
     Ok(())
 }
 
