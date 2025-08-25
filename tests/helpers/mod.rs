@@ -8,6 +8,120 @@ use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
+/// Test cleanup handler that ensures resources are freed even on test failure
+pub struct TestCleanup {
+    pub ssh_tasks: Vec<tokio::task::AbortHandle>,
+    pub service_handle: Option<tokio::task::AbortHandle>,
+    pub bind_addr: String,
+}
+
+impl TestCleanup {
+    pub fn new(bind_addr: String) -> Self {
+        Self {
+            ssh_tasks: Vec::new(),
+            service_handle: None,
+            bind_addr,
+        }
+    }
+
+    pub fn add_ssh_task(&mut self, task: &tokio::task::JoinHandle<()>) {
+        self.ssh_tasks.push(task.abort_handle());
+    }
+
+    pub fn set_service_handle(&mut self, handle: &tokio::task::JoinHandle<()>) {
+        self.service_handle = Some(handle.abort_handle());
+    }
+
+    /// Perform cleanup - can be called explicitly or automatically on drop
+    pub fn cleanup(&mut self) {
+        use log::info;
+
+        info!("Cleaning up test resources");
+
+        // Unbind the address first
+        sshbind::unbind(&self.bind_addr);
+
+        // Abort all tasks
+        for task in &self.ssh_tasks {
+            task.abort();
+        }
+        if let Some(handle) = &self.service_handle {
+            handle.abort();
+        }
+
+        // Clear the collections
+        self.ssh_tasks.clear();
+        self.service_handle = None;
+    }
+}
+
+impl Drop for TestCleanup {
+    fn drop(&mut self) {
+        // Ensure cleanup happens even if test panics
+        self.cleanup();
+    }
+}
+
+/// Port generator for tests - each test gets a unique range
+/// Base port starts at 10000 and each test gets a range based on jump host count
+pub struct TestPorts {
+    base: u16,
+    jump_host_count: usize,
+    jump_hosts: Vec<String>,
+}
+
+impl TestPorts {
+    /// Create a new TestPorts instance with a unique test ID and number of jump hosts
+    /// test_id should be unique per test (e.g., 1, 2, 3, etc.)
+    /// jump_host_count is the number of SSH jump hosts this test needs
+    pub fn new(test_id: u16, jump_host_count: usize) -> Self {
+        // Each test gets a range of ports: bind(1) + jump_hosts(N) + service(1) + buffer(2)
+        // So test needs (jump_host_count + 4) ports total
+        let base = 10000 + (test_id * 10); // Still use 10-port ranges for simplicity
+
+        // Generate jump host addresses
+        let jump_hosts = (0..jump_host_count)
+            .map(|i| format!("127.0.0.1:{}", base + 1 + (i as u16)))
+            .collect();
+
+        TestPorts {
+            base,
+            jump_host_count,
+            jump_hosts,
+        }
+    }
+
+    /// Get the bind address (always port 0 in range)
+    pub fn bind_addr(&self) -> String {
+        format!("127.0.0.1:{}", self.base)
+    }
+
+    /// Get the service address (always after all jump hosts)
+    pub fn service_addr(&self) -> String {
+        format!(
+            "127.0.0.1:{}",
+            self.base + 1 + (self.jump_host_count as u16)
+        )
+    }
+
+    /// Get jump host addresses as a vector
+    pub fn jump_hosts(&self) -> Vec<String> {
+        self.jump_hosts.clone()
+    }
+
+    /// Get a specific jump host address by index
+    pub fn jump_host(&self, index: usize) -> String {
+        if index >= self.jump_host_count {
+            panic!(
+                "Jump host index {} out of range (max: {})",
+                index,
+                self.jump_host_count - 1
+            );
+        }
+        self.jump_hosts[index].clone()
+    }
+}
+
 pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
     let binding = std::env::current_dir().unwrap();
     let wd = binding.as_path();

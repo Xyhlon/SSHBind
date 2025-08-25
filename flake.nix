@@ -183,14 +183,14 @@
         # Run tests with cargo-nextest
         # Consider setting `doCheck = false` on `my-crate` if you do not want
         # the tests to run twice
-        # sshbind-nextest = craneLib.cargoNextest (commonArgs
-        #   // {
-        #     inherit cargoArtifacts;
-        #     partitions = 1;
-        #     partitionType = "count";
-        #     withLlvmCov = true;
-        #     # sandbox-paths = /tmp;
-        #   });
+        sshbind-nextest = craneLib.cargoNextest (commonArgs
+          // {
+            inherit cargoArtifacts;
+            partitions = 1;
+            partitionType = "count";
+            withLlvmCov = true;
+            # sandbox-paths = /tmp;
+          });
       };
 
       packages =
