@@ -424,6 +424,27 @@ where
 type SharedSession = Arc<Mutex<Option<AsyncSession<AsyncTcpStream>>>>;
 type FailureCounter = Arc<Mutex<u32>>;
 
+/// Configuration for tunnel connections
+#[derive(Clone)]
+struct TunnelConfig {
+    ex: Arc<Executor<'static>>,
+    shared_session: SharedSession,
+    jump_hosts: Vec<HostPort>,
+    creds: YamlCreds,
+    failure_counter: FailureCounter,
+    tunnel_cancel_tx: Sender<()>,
+}
+
+/// Configuration for the server
+struct ServerConfig {
+    ex: Arc<Executor<'static>>,
+    addr: String,
+    jump_hosts: Vec<HostPort>,
+    remote_addr: Option<HostPort>,
+    cmd: Option<String>,
+    creds: YamlCreds,
+}
+
 async fn cleanup_session(shared_session: &SharedSession) -> Result<(), Box<dyn Error>> {
     info!("Starting session cleanup");
     let session_opt = {
@@ -592,19 +613,14 @@ async fn is_session_healthy(session: &AsyncSession<AsyncTcpStream>) -> bool {
 }
 
 async fn connect_to_tunnel(
-    ex: Arc<Executor<'_>>,
+    config: &TunnelConfig,
     inbound: AsyncTcpStream,
-    shared_session: SharedSession,
-    jump_hosts: &[HostPort],
     remote_addr: Option<&HostPort>,
     cmd: Option<&str>,
     cancel_rx: Receiver<()>,
-    failure_counter: FailureCounter,
-    creds_map: &YamlCreds,
-    tunnel_cancel_tx: Sender<()>,
 ) -> Result<(), Box<dyn Error>> {
     let session = {
-        let session_guard = shared_session.lock().unwrap();
+        let session_guard = config.shared_session.lock().unwrap();
         match &*session_guard {
             Some(session) => session.clone(),
             None => {
@@ -616,10 +632,10 @@ async fn connect_to_tunnel(
 
     let (connection_success, should_heal, current_failures, error_msg_opt) =
         match connect_to_tunnel_inner(
-            ex.clone(),
+            config.ex.clone(),
             inbound,
             session,
-            jump_hosts,
+            &config.jump_hosts,
             remote_addr,
             cmd,
             cancel_rx,
@@ -628,7 +644,7 @@ async fn connect_to_tunnel(
         {
             Ok(_) => {
                 // Reset failure counter on successful connection
-                let mut counter = failure_counter.lock().unwrap();
+                let mut counter = config.failure_counter.lock().unwrap();
                 *counter = 0;
                 (true, false, 0, None)
             }
@@ -641,14 +657,14 @@ async fn connect_to_tunnel(
 
                     // Increment failure counter
                     let current_failures = {
-                        let mut counter = failure_counter.lock().unwrap();
+                        let mut counter = config.failure_counter.lock().unwrap();
                         *counter += 1;
                         *counter
                     };
                     (false, true, current_failures, Some(error_str))
                 } else {
                     // Reset failure counter for non-healable errors
-                    let mut counter = failure_counter.lock().unwrap();
+                    let mut counter = config.failure_counter.lock().unwrap();
                     *counter = 0;
                     (false, false, 0, Some(error_str))
                 }
@@ -663,11 +679,11 @@ async fn connect_to_tunnel(
         );
 
         if let Err(heal_error) = heal_session_with_retry(
-            &shared_session,
-            ex.clone(),
-            jump_hosts,
-            creds_map,
-            tunnel_cancel_tx.clone(),
+            &config.shared_session,
+            config.ex.clone(),
+            &config.jump_hosts,
+            &config.creds,
+            config.tunnel_cancel_tx.clone(),
             3,
         )
         .await
@@ -676,7 +692,7 @@ async fn connect_to_tunnel(
             error!("Immediate session healing failed: {}", heal_error_str);
         } else {
             // Reset failure counter on successful healing
-            let mut counter = failure_counter.lock().unwrap();
+            let mut counter = config.failure_counter.lock().unwrap();
             *counter = 0;
             info!("Session healing completed, failure counter reset");
         }
@@ -823,17 +839,12 @@ where
 /// * Forwarding data between the local connection and the SSH channel fails.
 ///
 async fn run_server(
-    ex: Arc<Executor<'_>>,
-    addr: &str,
-    jump_hosts: Vec<HostPort>,
-    remote_addr: Option<HostPort>,
-    cmd: Option<&str>,
-    creds: YamlCreds,
+    config: ServerConfig,
     cancel_rx: Receiver<()>,
     pair: Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<(), Box<dyn Error>> {
-    let listener = AsyncTcpListener::bind(addr.parse::<SocketAddr>()?)?;
-    info!("Listening on {addr}");
+    let listener = AsyncTcpListener::bind(config.addr.parse::<SocketAddr>()?)?;
+    info!("Listening on {}", config.addr);
     {
         let (lock, cvar) = &*pair;
         let mut pending = lock.lock().unwrap();
@@ -841,10 +852,15 @@ async fn run_server(
         // We notify the condvar that the value has changed.
         cvar.notify_one();
     }
-    let remote_addr = remote_addr.as_ref();
+    let remote_addr = config.remote_addr.as_ref();
     let (tunnel_cancel_tx, tunnel_cancel_rx) = async_channel::unbounded();
-    let initial_session =
-        connect_chain(ex.clone(), &jump_hosts, &creds, tunnel_cancel_tx.clone()).await?;
+    let initial_session = connect_chain(
+        config.ex.clone(),
+        &config.jump_hosts,
+        &config.creds,
+        tunnel_cancel_tx.clone(),
+    )
+    .await?;
     let shared_session: SharedSession = Arc::new(Mutex::new(Some(initial_session)));
     let failure_counter: FailureCounter = Arc::new(Mutex::new(0));
     info!("SSH session established");
@@ -853,12 +869,12 @@ async fn run_server(
     let session_monitor = {
         let shared_session_clone = shared_session.clone();
         let failure_counter_clone = failure_counter.clone();
-        let ex_clone = ex.clone();
-        let jump_hosts_clone = jump_hosts.clone();
-        let creds_clone = creds.clone();
+        let ex_clone = config.ex.clone();
+        let jump_hosts_clone = config.jump_hosts.clone();
+        let creds_clone = config.creds.clone();
         let tunnel_cancel_tx_clone = tunnel_cancel_tx.clone();
 
-        ex.spawn(async move {
+        config.ex.spawn(async move {
             let mut healing_in_progress = false;
             let mut consecutive_failures = 0u32;
 
@@ -881,8 +897,12 @@ async fn run_server(
                     }
                 };
 
-                if !session_healthy && !healing_in_progress {
-                    healing_in_progress = true;
+                if !session_healthy {
+                    #[allow(unused_assignments)]
+                    // Value read in next loop iteration to prevent concurrent healing
+                    {
+                        healing_in_progress = true;
+                    }
                     consecutive_failures += 1;
 
                     warn!(
@@ -942,28 +962,25 @@ async fn run_server(
                 };
 
                 // Handle each connection in a separate task
-                let shared_session_clone = shared_session.clone();
-                let failure_counter_clone = failure_counter.clone();
-                let jump_hosts_clone = jump_hosts.clone();
+                let tunnel_config = TunnelConfig {
+                    ex: config.ex.clone(),
+                    shared_session: shared_session.clone(),
+                    jump_hosts: config.jump_hosts.clone(),
+                    creds: config.creds.clone(),
+                    failure_counter: failure_counter.clone(),
+                    tunnel_cancel_tx: tunnel_cancel_tx.clone(),
+                };
                 let remote_addr_clone = remote_addr.cloned();
-                let cmd_clone = cmd.map(|s| s.to_string());
+                let cmd_clone = config.cmd.clone();
                 let tunnel_rx = tunnel_cancel_rx.clone();
-                let ex_clone = ex.clone();
-                let creds_clone = creds.clone();
-                let tunnel_cancel_tx_clone = tunnel_cancel_tx.clone();
 
-                ex.spawn(async move {
+                config.ex.spawn(async move {
                     match connect_to_tunnel(
-                        ex_clone,
+                        &tunnel_config,
                         sock,
-                        shared_session_clone,
-                        &jump_hosts_clone,
                         remote_addr_clone.as_ref(),
                         cmd_clone.as_deref(),
                         tunnel_rx,
-                        failure_counter_clone,
-                        &creds_clone,
-                        tunnel_cancel_tx_clone,
                     ).await {
                         Ok(_) => {
                             info!("Connection handled successfully");
@@ -1138,18 +1155,16 @@ pub fn bind(
             .each(0..4, |_| block_on(ex.run(async { shutdown.recv().await })))
             .finish(|| {
                 block_on(local_ex.run(async {
-                    if let Err(e) = run_server(
-                        ex.clone(),
-                        &bind_addr,
+                    let server_config = ServerConfig {
+                        ex: ex.clone(),
+                        addr: bind_addr.clone(),
                         jump_hosts,
                         remote_addr,
-                        cmd.as_deref(),
+                        cmd: cmd.clone(),
                         creds,
-                        cancel_rx,
-                        pair_clone,
-                    )
-                    .await
-                    {
+                    };
+
+                    if let Err(e) = run_server(server_config, cancel_rx, pair_clone).await {
                         error!("Server error: {e}");
                     }
 
