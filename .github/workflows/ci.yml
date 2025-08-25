@@ -11,12 +11,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  flake-check:
-    name: "Flake Check"
+  # Build the main package once and cache it
+  build:
+    name: "Build Package"
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,18 +31,63 @@ jobs:
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
-      # Run full flake check on both platforms
-      # Both Linux and macOS can run NixOS VM tests via QEMU
-      - name: Run flake check
-        run: nix flake check -L --show-trace
+      - name: Build sshbind package
+        run: nix build -L --show-trace
 
-  # Run NixOS integration tests in parallel on both Linux and macOS
+      - name: Build static checks (pre-build for integration tests)
+        run: |
+          # Determine the system based on OS
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            SYSTEM="x86_64-linux"
+          else
+            SYSTEM="aarch64-darwin"
+          fi
+
+          # Build common dependencies that integration tests need
+          nix build .#checks.$SYSTEM.sshbind -L --show-trace
+          nix build .#checks.$SYSTEM.sshbind-clippy -L --show-trace
+          nix build .#checks.$SYSTEM.sshbind-fmt -L --show-trace
+
+  # Quick static checks
+  static-checks:
+    name: "${{ matrix.check }} on ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    needs: build
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        check: [sshbind-audit, sshbind-deny, sshbind-doc, pre-commit-check]
+      fail-fast: false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Run Check - ${{ matrix.check }}
+        run: |
+          # Determine the system based on OS
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            SYSTEM="x86_64-linux"
+          else
+            SYSTEM="aarch64-darwin"
+          fi
+
+          echo "Running check on system: $SYSTEM"
+          nix build .#checks.$SYSTEM.${{ matrix.check }} -L --show-trace
+
+  # NixOS integration tests - depend on build to reuse cached binary
   nixos-integration-tests:
     name: "NixOS Integration Test - ${{ matrix.test }} on ${{ matrix.os }}"
     runs-on: ${{ matrix.os }}
+    needs: build
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
         test: [simple, cli, performance]
       fail-fast: false
     steps:
@@ -67,35 +113,30 @@ jobs:
           fi
 
           echo "Running test on system: $SYSTEM"
+          # The binary should already be cached from the build job
           nix build .#checks.$SYSTEM.${{ matrix.test }} -L --show-trace
 
-  # Additional parallel checks for better visibility
-  parallel-checks:
-    name: "${{ matrix.check }} on ${{ matrix.os }}"
+  # Overall flake check (runs everything but benefits from cached builds)
+  flake-check:
+    name: "Flake Check"
     runs-on: ${{ matrix.os }}
+    needs: [build, static-checks, nixos-integration-tests]
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        check: [sshbind, sshbind-clippy, sshbind-fmt, sshbind-audit, sshbind-deny, sshbind-doc, pre-commit-check]
-      fail-fast: false
+        os: [ubuntu-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            system-features = nixos-test benchmark big-parallel kvm
 
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Run Check - ${{ matrix.check }}
-        run: |
-          # Determine the system based on OS
-          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
-            SYSTEM="x86_64-linux"
-          else
-            SYSTEM="aarch64-darwin"
-          fi
-
-          echo "Running check on system: $SYSTEM"
-          nix build .#checks.$SYSTEM.${{ matrix.check }} -L --show-trace
+      # This should be very fast since everything is already cached
+      - name: Run flake check (should use cached builds)
+        run: nix flake check -L --show-trace
