@@ -1,11 +1,11 @@
 [profile.default]
 slow-timeout = { period = "2s", terminate-after = 4 }
 
-[test-groups]
-resource-limited = { max-threads = 4 }
-serial-integration = { max-threads = 1 }
+# [test-groups]
+# resource-limited = { max-threads = 4 }
+# serial-integration = { max-threads = 1 }
 
 
-[[profile.default.overrides]]
-filter = 'test(serial_integration)'
-test-group = 'serial-integration'
+# [[profile.default.overrides]]
+# filter = 'test(serial_integration)'
+# test-group = 'serial-integration'

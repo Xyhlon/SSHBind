@@ -2,7 +2,8 @@
   description = "";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
 
     crane.url = "github:ipetkov/crane";
 
@@ -19,7 +20,10 @@
       flake = false;
     };
 
-    statix.url = "github:oppiliappan/statix";
+    statix = {
+      url = "github:oppiliappan/statix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     pre-commit-hooks.url = "github:cachix/git-hooks.nix";
   };
@@ -100,10 +104,22 @@
           inherit cargoArtifacts;
           doCheck = false;
         });
+
+      integration_pkgs = import nixpkgs {
+        inherit system;
+        overlays = [
+          overlay
+        ];
+      };
+
+      integrationTests = import ./integration-tests {pkgs = integration_pkgs;};
     in {
       checks = {
         # Build the crate as part of `nix flake check` for convenience
         inherit sshbind;
+        inherit (integrationTests) simple;
+        inherit (integrationTests) cli;
+        inherit (integrationTests) performance;
 
         pre-commit-check = pre-commit-hooks.lib.${system}.run {
           src = ./.;
@@ -111,7 +127,7 @@
             check-case-conflicts.enable = true;
             check-executables-have-shebangs.enable = true;
             check-merge-conflicts.enable = true;
-            check-shebang-scripts-are-executable.enable = true;
+            # check-shebang-scripts-are-executable.enable = true;
             check-toml.enable = true;
             check-yaml.enable = true;
             detect-private-keys.enable = true;

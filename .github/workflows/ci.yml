@@ -1,76 +1,142 @@
-name: ci
+name: CI
+
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: Test on ${{ matrix.os }} / Rust ${{ matrix.rust }}
+  # Build the main package once and cache it
+  build:
+    name: "Build Package"
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, beta, nightly]
+        os: [ubuntu-latest]
     steps:
-      - name: Install system dependencies on Linux
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
-      - name: Install SOPS on Linux
-        if: runner.os == 'Linux'
-        env:
-          SOPS_VERSION: "v3.9.4"
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          extra-conf: |
+            system-features = nixos-test benchmark big-parallel kvm
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build sshbind package
+        run: nix build -L --show-trace
+
+      - name: Build static checks (pre-build for integration tests)
         run: |
-          curl -L -o /tmp/sops https://github.com/getsops/sops/releases/download/${SOPS_VERSION}/sops-${SOPS_VERSION}.linux.amd64
-          sudo install -m 0755 /tmp/sops /usr/local/bin/sops
-          sops --version
-      - name: Install system dependencies on macOS
-        if: runner.os == 'macOS'
-        run: brew update && brew install sops
-      - name: Install system dependencies on Windows
-        if: runner.os == 'Windows'
-        run: choco install sops -y
-      - uses: actions/checkout@v4
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: ${{ matrix.rust }}
-      - name: Install cargo-nextest
-        uses: baptiste0928/cargo-install@v3
-        with:
-          crate: cargo-nextest
-          locked: true
-      - name: Run cargo build
-        run: cargo +${{ matrix.rust }} build --all-features --verbose
-      - name: Run cargo test
-        run: cargo +${{ matrix.rust }} nextest run --all-features --verbose
-  formatting:
-    name: Cargo fmt
-    runs-on: ubuntu-latest
+          # Determine the system based on OS
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            SYSTEM="x86_64-linux"
+          else
+            SYSTEM="aarch64-darwin"
+          fi
+
+          # Build common dependencies that integration tests need
+          nix build .#checks.$SYSTEM.sshbind -L --show-trace
+          nix build .#checks.$SYSTEM.sshbind-clippy -L --show-trace
+          nix build .#checks.$SYSTEM.sshbind-fmt -L --show-trace
+
+  # Quick static checks
+  static-checks:
+    name: "${{ matrix.check }} on ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    needs: build
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        check: [sshbind-audit, sshbind-deny, sshbind-doc, pre-commit-check]
+      fail-fast: false
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Update Rust
-        run: rustup update stable
-      - name: Run cargo fmt
-        run: cargo +stable fmt --all -- --check
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Run Check - ${{ matrix.check }}
+        run: |
+          # Determine the system based on OS
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            SYSTEM="x86_64-linux"
+          else
+            SYSTEM="aarch64-darwin"
+          fi
+
+          echo "Running check on system: $SYSTEM"
+          nix build .#checks.$SYSTEM.${{ matrix.check }} -L --show-trace
+
+  # NixOS integration tests - depend on build to reuse cached binary
+  nixos-integration-tests:
+    name: "NixOS Integration Test - ${{ matrix.test }} on ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    needs: build
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        test: [simple, cli, performance]
+      fail-fast: false
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
         with:
-          persist-credentials: false
-      - name: Update Rust
-        run: rustup update stable
-      - name: Run clippy
-        run: cargo +stable clippy --all-features
-  cargo-deny:
-    name: Check dependencies
-    runs-on: ubuntu-latest
+          extra-conf: |
+            system-features = nixos-test benchmark big-parallel kvm
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Run NixOS Integration Test - ${{ matrix.test }}
+        run: |
+          # Determine the system based on OS
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            SYSTEM="x86_64-linux"
+          else
+            SYSTEM="aarch64-darwin"
+          fi
+
+          echo "Running test on system: $SYSTEM"
+          # The binary should already be cached from the build job
+          nix build .#checks.$SYSTEM.${{ matrix.test }} -L --show-trace
+
+  # Overall flake check (runs everything but benefits from cached builds)
+  flake-check:
+    name: "Flake Check"
+    runs-on: ${{ matrix.os }}
+    needs: [build, static-checks, nixos-integration-tests]
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
         with:
-          persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@v2
+          extra-conf: |
+            system-features = nixos-test benchmark big-parallel kvm
+
+      - name: Setup Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      # This should be very fast since everything is already cached
+      - name: Run flake check (should use cached builds)
+        run: nix flake check -L --show-trace

@@ -13,16 +13,37 @@ documentation = "https://docs.rs/sshbind"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-async-ssh2-lite = { version = "0.5.0", features = ["tokio"] }
+# Using forked version that removes the problematic assertions
+async-ssh2-lite = { git = "https://github.com/bk-rs/ssh-rs", branch = "main", features = [
+  "async-io",
+] }
+# async-ssh2-lite = { git = "https://github.com/krystophny/ssh-rs", rev = "b50e0bcb1a85215c6328bfed1df13038359818fc", features = [
+#   "tokio",
+# ] }
+async-channel = "2.3.2"
+async-executor = "1.13.1"
+async-io = "2.5.0"
+# async-ssh2-lite = { version = "0.5.0", features = [
+#   "async-io",
+# ] }
+cfg-if = "1.0.0"
+clap = { version = "4.5.32", features = ["derive"] }
 dirs = "6.0.0"
+easy-parallel = "3.3.1"
 env_logger = "0.11.6"
+futures = "0.3.31"
+futures-lite = "2.3.0"
+interprocess = "2.2.3"
 libreauth = "0.17.0"
 log = "0.4.26"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0.140"
 serde_yml = "0.0.12"
-ssh2-config = "0.4.0"
-tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7.13"
+shared_memory = "0.12.4"
+socket2 = "0.5"
+ssh2-config = "0.5.4"
+tempfile = "3.17.1"
+url = "2.5.4"
 
 [dev-dependencies]
 secrecy = "0.10.3"
@@ -34,3 +55,7 @@ async-trait = "0.1.86"
 log = "0.4.26"
 env_logger = "0.11.6"
 serial_test = "3.2.0"
+
+# Platform-specific dependencies for binary (excluded on macOS)
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+named-sem = "0.2.3"

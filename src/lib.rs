@@ -1,26 +1,180 @@
+//! # SSHBind Library
+//!
+//! SSHBind is a Rust library that enables developers to programmatically bind services
+//! located behind multiple SSH connections to a local socket. This facilitates secure and
+//! seamless access to remote services, even those that are otherwise unreachable.
+//!
+//! ## Features
+//!
+//! - **Multiple Jump Host Support**: Navigate through a series of SSH jump hosts to reach
+//!   the target service
+//! - **Local Socket Binding**: Expose remote services on local sockets, making them
+//!   accessible as if they were running locally
+//! - **Encrypted Credential Management**: Utilize SOPS-encrypted YAML files for secure
+//!   credential storage
+//! - **TOTP-based 2FA Support**: Programmatic two-factor authentication using time-based
+//!   one-time passwords
+//! - **Automatic Reconnection**: Seamlessly handle connection interruptions by
+//!   automatically reconnecting to services
+//! - **Session Reuse**: Efficiently reuse SSH sessions to avoid overwhelming SSH servers
+//!
+//! ## Platform Support
+//!
+//! - **Library**: Supports macOS, Linux, and Windows
+//! - **CLI Application**: Currently supported on Linux and Windows only
+//!
+//! ## Basic Usage
+//!
+//! ```rust,no_run
+//! use sshbind::{bind, unbind};
+//!
+//! // Bind a remote service to a local address
+//! let local_addr = "127.0.0.1:8000";
+//! let jump_hosts = vec!["jump1:22".to_string(), "jump2:22".to_string()];
+//! let remote_addr = Some("remote.service:80".to_string());
+//! let sopsfile = "secrets.yaml";
+//!
+//! bind(local_addr, jump_hosts, remote_addr, sopsfile, None);
+//!
+//! // Use the bound service...
+//!
+//! // Unbind when done
+//! unbind(local_addr);
+//! ```
+//!
+//! ## Credential Management
+//!
+//! Credentials are stored in SOPS-encrypted YAML files with the following structure:
+//!
+//! ```yaml
+//! host:22:  # hostname:port format
+//!   username: your_username
+//!   password: your_password
+//!   totp_key: optional_base32_totp_key  # For 2FA
+//! ```
+//!
+//! ## Architecture Notes
+//!
+//! - SSH sessions are reused across multiple connections to prevent overwhelming SSH servers
+//! - The library implements automatic session healing when connection issues are detected
+//! - All connections are handled asynchronously using the async/await model
+//! - Background monitoring ensures session health and triggers reconnections when needed
+
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::process::Command;
 use std::str::FromStr;
 use std::thread;
-use tokio::runtime::Runtime;
-use tokio_util::sync::CancellationToken;
+use url::{Host, Url};
 
 use async_ssh2_lite::ssh2::{KeyboardInteractivePrompt, Prompt};
-use async_ssh2_lite::{AsyncSession, SessionConfiguration, TokioTcpStream};
+use async_ssh2_lite::{AsyncSession, AsyncSessionStream, SessionConfiguration};
 use libreauth::oath::TOTPBuilder;
 use ssh2_config::{ParseRule, SshConfig};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::BufReader;
-use tokio::io::copy_bidirectional;
-use tokio::net::{TcpListener, TcpStream};
+use std::time::Duration;
+
+use async_channel::{Receiver, Sender};
+use async_executor::{Executor, Task};
+use async_io::Timer;
+use async_ssh2_lite::async_io::Async;
+use futures::future::FutureExt;
+use futures::{select, AsyncReadExt, AsyncWriteExt};
+// use futures_lite::future;
+use std::net::{TcpListener as StdTcpListener, TcpStream};
 
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
+type AsyncTcpStream = Async<TcpStream>;
+type AsyncTcpListener = Async<StdTcpListener>;
+
+/// Represents a host and port combination for SSH connections.
+///
+/// This structure is used throughout the library to represent network endpoints
+/// for SSH connections, including jump hosts and target services.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::convert::TryFrom;
+/// use sshbind::HostPort;
+///
+/// let host_port = HostPort::try_from("example.com:22").unwrap();
+/// assert_eq!(host_port.host, "example.com");
+/// assert_eq!(host_port.port, 22);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPort {
+    /// The hostname or IP address
+    pub host: String,
+    /// The port number
+    pub port: u16,
+}
+
+impl TryFrom<&str> for HostPort {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        let url = Url::parse(&format!("ssh://{}", s))
+            .map_err(|e| format!("invalid host:port syntax: {}", e))?;
+
+        let host = url
+            .host()
+            .ok_or_else(|| "missing host".to_string())
+            .map(|h| match h {
+                Host::Domain(d) => d.to_string(),
+                Host::Ipv4(d) => d.to_string(),
+                Host::Ipv6(d) => d.to_string(),
+            })?;
+
+        let port = url.port().ok_or_else(|| "missing port".to_string())?;
+
+        Ok(HostPort { host, port })
+    }
+}
+
+impl FromStr for HostPort {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        HostPort::try_from(s)
+    }
+}
+
+impl fmt::Display for HostPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+impl From<HostPort> for SocketAddr {
+    fn from(hp: HostPort) -> SocketAddr {
+        let s = format!("{}:{}", hp.host, hp.port);
+        s.to_socket_addrs()
+            .expect("Failed to convert HostPort to SocketAddr")
+            .next()
+            .expect("HostPort verified earlier")
+    }
+}
+
+/// Handles TOTP-based keyboard-interactive authentication prompts.
+///
+/// This handler automatically responds to SSH keyboard-interactive authentication
+/// prompts by detecting the type of prompt (username, password, or TOTP code)
+/// and providing the appropriate response from the stored credentials.
+///
+/// # Authentication Flow
+///
+/// The handler uses pattern matching on prompt text to determine the response:
+/// - Prompts containing "user" → responds with username
+/// - Prompts containing "pass" → responds with password
+/// - Prompts containing "otp", "2fa", "one", "time", "code", or "token" → generates TOTP code
+/// - Other prompts → responds with empty string
 pub struct TotpPromptHandler {
     creds: Creds,
 }
@@ -36,30 +190,46 @@ impl KeyboardInteractivePrompt for TotpPromptHandler {
         if !instructions.is_empty() {
             info!("Instructions: {}", instructions);
         }
-        let _ = self.creds.clone();
 
         let mut responses = Vec::with_capacity(prompts.len());
         for prompt in prompts {
             // Print the prompt text and flush to ensure it appears before input.
-            info!("{}", prompt.text);
-            let code = TOTPBuilder::new()
-                .base32_key(&self.creds.totp_key.clone().unwrap_or("".to_string()))
-                .finalize()
-                .expect("Failed to build totp builder")
-                .generate();
             let response = match prompt.text.to_lowercase() {
                 s if s.contains("user") => self.creds.username.clone(),
+                s if (s.contains("otp")
+                    || s.contains("2fa")
+                    || s.contains("one")
+                    || s.contains("time")
+                    || s.contains("code")
+                    || s.contains("token")) =>
+                {
+                    TOTPBuilder::new()
+                        .base32_key(&self.creds.totp_key.clone().expect("TOTP key is required"))
+                        .finalize()
+                        .expect("Failed to build totp builder")
+                        .generate()
+                }
                 s if s.contains("pass") => self.creds.password.clone(),
-                s if (s.contains("otp") || s.contains("2fa")) => code,
                 _ => "".into(),
             };
+            let response_type = match response {
+                ref s if *s == self.creds.username => "Username",
+                ref s if *s == self.creds.password => "Password",
+                ref s if s.is_empty() => "Nothing",
+                _ => "TOTP Code",
+            };
+            info!("Prompt: {} | Responsed with {}", prompt.text, response_type);
             responses.push(response);
         }
         responses
     }
 }
 
-/// Represents the standard SSH authentication methods.
+/// Represents the standard SSH authentication methods as defined in RFC 4252.
+///
+/// These authentication methods are tried in the order specified by the SSH server's
+/// `ssh-userauth` response. The library supports password, keyboard-interactive,
+/// and public key authentication methods.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum AuthMethod {
     Password,
@@ -96,15 +266,32 @@ impl fmt::Display for AuthMethod {
     }
 }
 
-/// A parser that preserves the ordering of the allowed authentication methods.
+/// A parser that preserves the ordering of allowed SSH authentication methods.
+///
+/// SSH servers return authentication methods in a comma-separated string. This parser
+/// maintains the server's preferred order while filtering out unsupported methods.
+/// This is crucial for security as servers may have specific authentication flows.
 #[derive(Debug)]
 struct OrderedAuthMethods {
     methods: Vec<AuthMethod>,
 }
 
 impl OrderedAuthMethods {
-    /// Parse a comma-separated list of methods (e.g. "password,publickey,hostbased,keyboard-interactive")
-    /// into an OrderedAuthMethods instance that preserves ordering.
+    /// Parses a comma-separated list of authentication methods.
+    ///
+    /// # Arguments
+    ///
+    /// * `methods_str` - Server response string (e.g., "password,publickey,keyboard-interactive")
+    ///
+    /// # Returns
+    ///
+    /// An OrderedAuthMethods instance with supported methods in server-preferred order.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let methods = OrderedAuthMethods::parse("password,publickey,keyboard-interactive");
+    /// ```
     fn parse(methods_str: &str) -> Self {
         // Split the input string and convert each method into an AuthMethod.
         // Filtering out unsupported ones.
@@ -116,25 +303,48 @@ impl OrderedAuthMethods {
     }
 }
 
-/// Authenticates a user for the given SSH session.
+/// Authenticates a user for the given SSH session using multiple authentication methods.
+///
+/// This function implements a robust authentication flow that:
+/// 1. Queries available authentication methods from the SSH server
+/// 2. Attempts each method in the server's preferred order
+/// 3. Handles partial authentication for multi-factor setups
+/// 4. Supports password, keyboard-interactive, and public key authentication
+/// 5. Automatically generates TOTP codes when required
 ///
 /// # Arguments
 ///
-/// * `session` - A reference to the `AsyncSession` object.
-/// * `creds_map` - A reference to a map containing credentials for each host.
-/// * `host` - The hostname or IP address of the SSH server.
+/// * `session` - The SSH session to authenticate
+/// * `creds_map` - Map of host credentials loaded from SOPS file
+/// * `host` - The target host being authenticated to
 ///
 /// # Returns
 ///
-/// A `Result` indicating success or failure of the authentication process.
+/// * `Ok(())` - Authentication successful
+/// * `Err(Box<dyn Error>)` - Authentication failed or credentials not found
 ///
+/// # Errors
+///
+/// This function will return an error if:
+/// - No credentials are found for the specified host
+/// - All authentication methods fail
+/// - Network errors occur during authentication
+/// - TOTP key is required but not provided
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let session = AsyncSession::new(stream, config)?;
+/// session.handshake().await?;
+/// userauth(&session, &creds_map, &host).await?;
+/// ```
 async fn userauth(
-    session: &AsyncSession<TokioTcpStream>,
+    session: &AsyncSession<AsyncTcpStream>,
     creds_map: &YamlCreds,
-    host: &str,
+    host: &HostPort,
 ) -> Result<(), Box<dyn Error>> {
     let creds = creds_map
-        .get(host)
+        .get(&host.to_string())
         .ok_or_else(|| format!("Couldn't find credentials for {}", host))?;
     let username = creds.username.clone();
     let password = creds.password.clone();
@@ -152,69 +362,50 @@ async fn userauth(
     while !ordered_auth.methods.is_empty() && !session.authenticated() {
         // Remove the first (preferred) method.
         let method = ordered_auth.methods.remove(0);
-        match method {
-            AuthMethod::Password => {
-                let result = session.userauth_password(&username, &password).await;
-                match result {
-                    Ok(_) if session.authenticated() => {
-                        info!("Authenticated via password.");
-                        break;
-                    }
-                    Ok(_) => {
-                        info!("Password authentication succeeded partially.");
-                        // Reparse to get the updated list of allowed methods.
-                        let new_auth_methods = session.auth_methods(&username).await?;
-                        ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
-                        info!("Updated authentication methods: {:?}", ordered_auth);
-                    }
-                    Err(e) => match totp_key {
-                        // this seems hacky but currently the only way to handle partial auth
-                        Some(_) => {
-                            info!("Probably partial auth: {:?}", e);
-                            ordered_auth =
-                                OrderedAuthMethods::parse(session.auth_methods(&username).await?);
-                            ordered_auth.methods.retain(|m| *m != AuthMethod::Password);
-                            ordered_auth.methods.retain(|m| *m != AuthMethod::PublicKey);
-                            info!(
-                                "Available authentication methods in order: {:?}",
-                                ordered_auth
-                            );
-                        }
-                        None => {
-                            error!("Password authentication failed: {:?}", e);
-                        }
-                    },
-                }
-            }
+        info!("Trying authentication method: {}", method);
+        let result = match method {
+            AuthMethod::Password => session.userauth_password(&username, &password).await,
             AuthMethod::KeyboardInteractive => {
                 let mut prompter = TotpPromptHandler {
                     creds: creds.clone(),
                 };
                 session
                     .userauth_keyboard_interactive(&username, &mut prompter)
-                    .await?;
-                if session.authenticated() {
-                    info!("Authenticated via keyboard-interactive.");
-                    break;
-                }
+                    .await
             }
             AuthMethod::PublicKey => {
                 info!("Attempting public key authentication via ssh config.");
 
                 let host_params = {
                     // Read and parse the SSH configuration from ~/.ssh/config.
-                    let home = dirs::home_dir().ok_or("No home directory found")?;
+                    let home = dirs::home_dir().expect("No home directory found");
                     let config_path = home.join(".ssh/config");
+                    // open file if exists else continue
+                    let config_path = if config_path.exists() {
+                        config_path
+                    } else {
+                        info!("SSH config file not found at {:?}. Trying other Authentication Methods", config_path);
+                        continue;
+                    };
                     let file = File::open(&config_path)
                         .map_err(|e| format!("Failed to open SSH config: {}", e))?;
                     let mut reader = BufReader::new(file);
-                    let config = SshConfig::default()
-                        .parse(&mut reader, ParseRule::STRICT)
-                        .map_err(|e| format!("Failed to parse SSH config: {:?}", e))?;
+                    // Parse the SSH config file. if fails continue
+                    let config = SshConfig::default().parse(&mut reader, ParseRule::STRICT);
+
+                    let config = match config {
+                        Ok(config) => config,
+                        Err(_) => {
+                            info!(
+                            "Failed to parse SSH config: {:?}. Trying other Authentication Methods",
+                            config_path
+                        );
+                            continue;
+                        }
+                    };
 
                     // Query the config for this host.
-                    let hostname = host.split(':').next().expect("Hostname could have a port");
-                    config.query(hostname)
+                    config.query(&host.host)
                 };
 
                 if let Some(identity_files) = host_params.identity_file {
@@ -229,22 +420,47 @@ async fn userauth(
                             identity_file,
                             None, // Optionally supply a passphrase here
                         )
-                        .await?;
-                    if session.authenticated() {
-                        info!("Authenticated via public key.");
-                        break;
-                    } else {
-                        warn!("Public key authentication failed.");
-                        let new_auth_methods = session.auth_methods(&username).await?;
-                        ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
-                    }
+                        .await
                 } else {
                     warn!("No IdentityFile found in SSH config for host {}", host);
+                    continue;
                 }
             }
             _ => {
                 info!("Skipping unsupported method: {}", method);
+                continue;
             }
+        };
+
+        match result {
+            Ok(_) if session.authenticated() => {
+                info!("Authenticated via {}.", method);
+                break;
+            }
+            Ok(_) => {
+                info!("{} authentication succeeded partially.", method);
+                // Reparse to get the updated list of allowed methods.
+                let new_auth_methods = session.auth_methods(&username).await?;
+                ordered_auth = OrderedAuthMethods::parse(new_auth_methods);
+                info!("Updated authentication methods: {:?}", ordered_auth);
+            }
+            Err(e) => match totp_key {
+                // this seems hacky but currently the only way to handle partial auth
+                Some(_) => {
+                    info!("Probably partial auth: {:?}", e);
+                    ordered_auth =
+                        OrderedAuthMethods::parse(session.auth_methods(&username).await?);
+                    ordered_auth.methods.retain(|m| *m != method);
+                    ordered_auth.methods.retain(|m| *m != AuthMethod::PublicKey);
+                    info!(
+                        "Available authentication methods in order: {:?}",
+                        ordered_auth
+                    );
+                }
+                None => {
+                    error!("Password authentication failed: {:?}", e);
+                }
+            },
         }
     }
 
@@ -261,60 +477,368 @@ async fn userauth(
     }
 }
 
-/// Establishes an SSH session chain through the given jump hosts.
+/// Creates a bidirectional data tunnel between two async streams.
+///
+/// This function establishes a high-performance bidirectional data bridge between
+/// two async streams, copying data in both directions simultaneously. It uses
+/// 16KB buffers for efficient data transfer and handles connection errors gracefully.
+///
+/// # Type Parameters
+///
+/// * `A` - First stream type (must implement AsyncReadExt + AsyncWriteExt + Unpin + Send)
+/// * `B` - Second stream type (must implement AsyncReadExt + AsyncWriteExt + Unpin + Send)
 ///
 /// # Arguments
 ///
-/// * `jump_hosts` - A slice of strings representing the jump host addresses.
-/// * `creds_map` - A reference to a map containing credentials for each host.
+/// * `ex` - Async executor for spawning the tunnel task
+/// * `a` - First stream (typically the local connection)
+/// * `b` - Second stream (typically the SSH channel)
+/// * `_cancel_rx` - Cancellation receiver (currently unused, reserved for future use)
 ///
 /// # Returns
 ///
-/// A `Result` containing the final `AsyncSession` connected to the last host in the chain,
-/// or an error if the connection fails.
+/// A detached task that runs the bidirectional tunnel until either:
+/// - One of the streams closes (EOF)
+/// - A network error occurs
+/// - The streams are disconnected
 ///
-async fn connect_chain(
-    jump_hosts: &[String],
+/// # Performance Notes
+///
+/// - Uses 16KB buffers for optimal throughput
+/// - Handles both streams concurrently using async select
+/// - Gracefully handles broken pipes and connection resets
+fn connect_chain_tunnel<A, B>(
+    ex: Arc<Executor<'_>>,
+    mut a: A,
+    mut b: B,
+    _cancel_rx: Receiver<()>,
+) -> Task<std::io::Result<()>>
+where
+    A: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+    B: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
+{
+    ex.spawn(async move {
+        info!("Bridge task starting");
+
+        let mut buf_a = vec![0; 16 * 1024];
+        let mut buf_b = vec![0; 16 * 1024];
+
+        loop {
+            select! {
+                ret_a = a.read(&mut buf_a).fuse() => match ret_a {
+                    Ok(0) => {
+                        info!("Bridge connection A read 0");
+                        break;
+                    },
+                    Ok(n) => {
+                        if let Err(err) = b.write_all(&buf_a[..n]).await {
+                            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                error!("Bridge write to B failed: {:?}", err);
+                            }
+                            break;
+                        }
+                    },
+                    Err(err) => {
+                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                            error!("Bridge read from A failed: {:?}", err);
+                        }
+                        break;
+                    }
+                },
+                ret_b = b.read(&mut buf_b).fuse() => match ret_b {
+                    Ok(0) => {
+                        info!("Bridge connection B read 0");
+                        break;
+                    },
+                    Ok(n) => {
+                        if let Err(err) = a.write_all(&buf_b[..n]).await {
+                            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                                error!("Bridge write to A failed: {:?}", err);
+                            }
+                            break;
+                        }
+                    },
+                    Err(err) => {
+                        if err.kind() != std::io::ErrorKind::UnexpectedEof {
+                            error!("Bridge read from B failed: {:?}", err);
+                        }
+                        break;
+                    }
+                },
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Establishes an SSH session chain through multiple jump hosts.
+///
+/// This is a critical function that creates a series of SSH connections through
+/// multiple jump hosts to reach a final destination. Each connection in the chain
+/// uses the previous connection as a tunnel, creating a secure path through
+/// multiple network segments.
+///
+/// # Connection Process
+///
+/// 1. Connect directly to the first jump host
+/// 2. For each subsequent jump host:
+///    - Create an SSH channel through the current session
+///    - Set up a local bridge listener
+///    - Connect through the bridge to establish the next hop
+///    - Authenticate to the new host
+///
+/// # Session Reuse Policy
+///
+/// **CRITICAL**: This function reuses SSH sessions to prevent overwhelming SSH servers.
+/// Creating new sessions for each connection could trigger rate limiting or DDoS
+/// protection mechanisms. Session reuse is mandatory and must not be violated.
+///
+/// # Arguments
+///
+/// * `ex` - Async executor for managing connection tasks
+/// * `jump_hosts` - Ordered list of jump hosts to traverse
+/// * `creds_map` - SSH credentials for each host
+/// * `_cancel_tx` - Cancellation channel (reserved for future use)
+///
+/// # Returns
+///
+/// * `Ok(AsyncSession)` - Authenticated session to the final jump host
+/// * `Err(Box<dyn Error>)` - Connection or authentication failure
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - No jump hosts are provided (assertion failure)
+/// - Any SSH connection fails
+/// - Authentication to any host fails
+/// - Network bridges cannot be established
+/// - Channel creation fails
+///
+type SharedSession = Arc<Mutex<Option<AsyncSession<AsyncTcpStream>>>>;
+type FailureCounter = Arc<Mutex<u32>>;
+
+/// Configuration for individual tunnel connections.
+///
+/// This structure contains all the necessary components for establishing
+/// and managing a single tunnel connection through the SSH chain.
+/// It includes session management, failure tracking, and cancellation support.
+#[derive(Clone)]
+struct TunnelConfig {
+    ex: Arc<Executor<'static>>,
+    shared_session: SharedSession,
+    jump_hosts: Vec<HostPort>,
+    creds: YamlCreds,
+    failure_counter: FailureCounter,
+    tunnel_cancel_tx: Sender<()>,
+}
+
+/// Configuration for the main TCP server.
+///
+/// This structure holds all the parameters needed to run the main TCP server
+/// that accepts incoming connections and forwards them through SSH tunnels.
+/// It includes the binding address, jump host chain, and credential information.
+struct ServerConfig {
+    ex: Arc<Executor<'static>>,
+    addr: String,
+    jump_hosts: Vec<HostPort>,
+    remote_addr: Option<HostPort>,
+    cmd: Option<String>,
+    creds: YamlCreds,
+}
+
+/// Safely cleans up an existing SSH session.
+///
+/// This function properly disconnects and cleans up an SSH session that may
+/// be in an unhealthy state. It's used as part of the session healing process
+/// to ensure clean state before establishing a new connection.
+///
+/// # Arguments
+///
+/// * `shared_session` - Shared reference to the session to clean up
+///
+/// # Returns
+///
+/// * `Ok(())` - Session cleaned up successfully
+/// * `Err(Box<dyn Error>)` - Cleanup operation failed
+async fn cleanup_session(shared_session: &SharedSession) -> Result<(), Box<dyn Error>> {
+    info!("Starting session cleanup");
+    let session_opt = {
+        let mut session_guard = shared_session.lock().unwrap();
+        session_guard.take()
+    };
+
+    if let Some(session) = session_opt {
+        info!("Disconnecting existing session");
+        let _ = session
+            .disconnect(None, "Session healing - cleaning up old session", None)
+            .await;
+    }
+    info!("Session cleanup completed");
+    Ok(())
+}
+
+/// Rebuilds an SSH session chain after connection failure.
+///
+/// This function performs a complete session rebuild by:
+/// 1. Cleaning up the existing (failed) session
+/// 2. Establishing a new connection chain through all jump hosts
+/// 3. Updating the shared session reference
+///
+/// This is used by the session healing mechanism when connection issues are detected.
+///
+/// # Arguments
+///
+/// * `shared_session` - Shared session reference to rebuild
+/// * `ex` - Async executor for connection tasks
+/// * `jump_hosts` - List of jump hosts to reconnect through
+/// * `creds_map` - SSH credentials for authentication
+/// * `cancel_tx` - Cancellation channel for the new session
+///
+/// # Returns
+///
+/// * `Ok(())` - Session rebuilt successfully
+/// * `Err(Box<dyn Error>)` - Rebuild failed
+async fn rebuild_session(
+    shared_session: &SharedSession,
+    ex: Arc<Executor<'_>>,
+    jump_hosts: &[HostPort],
     creds_map: &YamlCreds,
-) -> Result<AsyncSession<TokioTcpStream>, Box<dyn Error>> {
+    cancel_tx: Sender<()>,
+) -> Result<(), Box<dyn Error>> {
+    info!("Starting session rebuild");
+
+    cleanup_session(shared_session).await?;
+
+    let new_session = connect_chain(ex, jump_hosts, creds_map, cancel_tx).await?;
+
+    {
+        let mut session_guard = shared_session.lock().unwrap();
+        *session_guard = Some(new_session);
+    }
+
+    info!("Session rebuild completed successfully");
+    Ok(())
+}
+
+/// Heals a failed SSH session with exponential backoff retry logic.
+///
+/// This function implements a robust session healing mechanism that attempts
+/// to rebuild failed SSH connections with intelligent retry logic:
+///
+/// - Exponential backoff delays (capped at 30 seconds)
+/// - Configurable maximum retry attempts
+/// - Detailed logging of each attempt
+/// - Complete session rebuild on each retry
+///
+/// # Retry Strategy
+///
+/// - Attempt 1: Immediate
+/// - Attempt 2: 1 second delay
+/// - Attempt 3: 2 second delay
+/// - Attempt 4+: Exponential backoff up to 30 seconds
+///
+/// # Arguments
+///
+/// * `shared_session` - Session reference to heal
+/// * `ex` - Async executor for connection operations
+/// * `jump_hosts` - Jump host chain to reconnect through
+/// * `creds_map` - Authentication credentials
+/// * `cancel_tx` - Cancellation channel for new connections
+/// * `max_attempts` - Maximum number of retry attempts
+///
+/// # Returns
+///
+/// * `Ok(())` - Session healed successfully
+/// * `Err(Box<dyn Error>)` - All healing attempts failed
+async fn heal_session_with_retry(
+    shared_session: &SharedSession,
+    ex: Arc<Executor<'_>>,
+    jump_hosts: &[HostPort],
+    creds_map: &YamlCreds,
+    cancel_tx: Sender<()>,
+    max_attempts: u32,
+) -> Result<(), Box<dyn Error>> {
+    let mut attempt = 1;
+
+    while attempt <= max_attempts {
+        info!("Session healing attempt {} of {}", attempt, max_attempts);
+
+        let error_msg = match rebuild_session(
+            shared_session,
+            ex.clone(),
+            jump_hosts,
+            creds_map,
+            cancel_tx.clone(),
+        )
+        .await
+        {
+            Ok(_) => {
+                info!("Session healing successful after {} attempt(s)", attempt);
+                return Ok(());
+            }
+            Err(e) => e.to_string(),
+        };
+
+        error!("Session healing attempt {} failed: {}", attempt, error_msg);
+
+        if attempt == max_attempts {
+            error!("All session healing attempts exhausted");
+            return Err(format!(
+                "Session healing failed after {} attempts: {}",
+                max_attempts, error_msg
+            )
+            .into());
+        }
+
+        let delay_ms = std::cmp::min(1000 * (1 << (attempt - 1)), 30000);
+        warn!("Retrying session healing in {}ms", delay_ms);
+        Timer::after(Duration::from_millis(delay_ms)).await;
+
+        attempt += 1;
+    }
+
+    Err("Unexpected end of session healing retry loop".into())
+}
+
+async fn connect_chain(
+    ex: Arc<Executor<'_>>,
+    jump_hosts: &[HostPort],
+    creds_map: &YamlCreds,
+    _cancel_tx: Sender<()>,
+) -> Result<AsyncSession<AsyncTcpStream>, Box<dyn Error>> {
     assert!(!jump_hosts.is_empty(), "No jump hosts provided");
     info!("Starting SSH chain connection through {:?}", jump_hosts);
 
-    let jump_socket_addr = jump_hosts[0]
-        .to_socket_addrs()?
-        .next()
-        .ok_or("Failed to resolve address")?;
-
-    let mut session = AsyncSession::<TokioTcpStream>::connect(jump_socket_addr, None).await?;
+    let stream = AsyncTcpStream::connect(jump_hosts[0].clone()).await?;
+    let mut session = AsyncSession::new(stream, SessionConfiguration::default())?;
     session.handshake().await?;
     userauth(&session, creds_map, &jump_hosts[0]).await?;
 
     for (i, jump) in jump_hosts.iter().enumerate().skip(1) {
         info!("Connecting through jump {}: {}", i, jump);
-        let jump_socket_addr = jump
-            .to_socket_addrs()?
-            .next()
-            .ok_or("Failed to resolve address")?;
-        let mut channel = session
-            .channel_direct_tcpip(
-                &jump_socket_addr.ip().to_string(),
-                jump_socket_addr.port(),
-                None,
-            )
+        info!("Creating channel to {}:{}", jump.host, jump.port);
+        let channel = session
+            .channel_direct_tcpip(&jump.host, jump.port, None)
             .await?;
+        info!("Channel created successfully!");
 
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let local_addr = listener.local_addr()?;
+        let listener = AsyncTcpListener::bind("127.0.0.1:0".parse::<SocketAddr>()?)?;
+        let local_addr = listener.get_ref().local_addr()?;
+        info!("Local bridge listening on {}", local_addr);
 
         let accept_task =
-            tokio::spawn(async move { listener.accept().await.map(|(local_conn, _)| local_conn) });
+            ex.spawn(async move { listener.accept().await.map(|(local_conn, _)| local_conn) });
 
-        let client_conn = TcpStream::connect(local_addr).await?;
-        let mut server_conn = accept_task.await?.map_err(|e| e.to_string())?;
+        let client_conn = AsyncTcpStream::connect(local_addr).await?;
+        let server_conn = accept_task.await.map_err(|e| e.to_string())?;
 
-        tokio::spawn(async move {
-            let _ = copy_bidirectional(&mut channel, &mut server_conn).await;
-        });
+        // Use the chain tunnel version to keep the connection alive
+        let (_bridge_tx, bridge_rx) = async_channel::unbounded();
+        connect_chain_tunnel(ex.clone(), server_conn, channel, bridge_rx).detach();
+
+        // Give the bridge task a moment to start
+        Timer::after(Duration::from_millis(100)).await;
 
         session = AsyncSession::new(client_conn, SessionConfiguration::default())?;
         session.handshake().await?;
@@ -324,42 +848,424 @@ async fn connect_chain(
     Ok(session)
 }
 
-/// Runs an asynchronous TCP server that listens for incoming connections and forwards them
-/// through a chain of SSH jump hosts to a specified remote address.
+/// Determines if an error should trigger automatic session healing.
+///
+/// This function analyzes error messages to determine if they indicate
+/// connection issues that can be resolved by rebuilding the SSH session.
+/// It looks for specific error patterns that suggest network problems,
+/// authentication timeouts, or SSH protocol issues.
+///
+/// # Healable Error Patterns
+///
+/// - "channel session" - SSH channel creation failures
+/// - "connection reset" - Network connection issues
+/// - "broken pipe" - Broken network connections
+/// - "not authenticated" - Authentication state issues
+/// - "session closed" - SSH session termination
+/// - "transport read" - SSH transport layer errors
+/// - "would block" - Non-blocking I/O issues
 ///
 /// # Arguments
 ///
-/// * `addr` - The local address to bind the server to (e.g., "127.0.0.1:8000").
-/// * `jump_hosts` - A vector of SSH jump host addresses (e.g., ["jump1.example.com:22", "jump2.example.com:22"]).
-/// * `remote_addr` - The final remote address to forward connections to (e.g., "remote.example.com:80").
-/// * `creds` - A map containing SSH credentials for each host.
-/// * `cancel_token` - A cancellation token used to gracefully shut down the server.
+/// * `error` - The error to analyze
 ///
 /// # Returns
 ///
-/// This function returns a `Result` indicating success or failure. On success, it runs the server
-/// indefinitely until the cancellation token is triggered.
+/// * `true` - Error suggests healing may help
+/// * `false` - Error is not healable through session rebuild
+fn should_trigger_session_healing(error: &dyn Error) -> bool {
+    let error_str = error.to_string().to_lowercase();
+    error_str.contains("channel session")
+        || error_str.contains("connection reset")
+        || error_str.contains("broken pipe")
+        || error_str.contains("not authenticated")
+        || error_str.contains("session closed")
+        || error_str.contains("ssh disconnect")
+        || error_str.contains("transport read")
+        || error_str.contains("unable to send channel-open request")
+        || error_str.contains("channel open fail")
+        || error_str.contains("session(-7)")
+        || error_str.contains("would block")
+}
+
+/// Performs a health check on an SSH session.
+///
+/// This function tests if an SSH session is still functional by attempting
+/// to create a simple SSH channel. If the channel creation succeeds,
+/// the session is considered healthy. The test channel is properly closed
+/// to avoid resource leaks.
+///
+/// # Health Check Process
+///
+/// 1. Attempt to create a new SSH channel
+/// 2. If successful, immediately close the channel
+/// 3. Wait for channel closure confirmation
+/// 4. Return health status
+///
+/// # Arguments
+///
+/// * `session` - SSH session to check
+///
+/// # Returns
+///
+/// * `true` - Session is healthy and functional
+/// * `false` - Session has issues and may need healing
+async fn is_session_healthy(session: &AsyncSession<AsyncTcpStream>) -> bool {
+    // Try to create a simple channel to test if the session is still working
+    match session.channel_session().await {
+        Ok(mut channel) => {
+            // Close the channel properly
+            let _ = channel.close().await;
+            let _ = channel.wait_close().await;
+            true
+        }
+        Err(e) => {
+            warn!("Session health check failed: {}", e);
+            false
+        }
+    }
+}
+
+/// Connects an inbound TCP stream to a remote service through SSH tunneling.
+///
+/// This function handles the core tunneling logic for individual connections.
+/// It manages session health, implements automatic healing on failures,
+/// and tracks connection failures to trigger proactive session maintenance.
+///
+/// # Connection Modes
+///
+/// The function supports multiple connection modes based on the parameters:
+/// - **Direct tunneling**: Connect to a specific remote address through SSH
+/// - **Command execution**: Execute a command and tunnel through stdin/stdout
+/// - **Command + Address**: Execute a command then connect to the specified address
+///
+/// # Failure Handling
+///
+/// - Tracks consecutive connection failures
+/// - Triggers immediate session healing after 2+ failures
+/// - Resets failure counter on successful connections
+/// - Distinguishes between healable and non-healable errors
+///
+/// # Arguments
+///
+/// * `config` - Tunnel configuration including shared session and credentials
+/// * `inbound` - Local TCP connection from client
+/// * `remote_addr` - Optional target service address
+/// * `cmd` - Optional command to execute on remote host
+/// * `cancel_rx` - Cancellation receiver for graceful shutdown
+///
+/// # Returns
+///
+/// * `Ok(())` - Connection established and completed successfully
+/// * `Err(Box<dyn Error>)` - Connection failed
+async fn connect_to_tunnel(
+    config: &TunnelConfig,
+    inbound: AsyncTcpStream,
+    remote_addr: Option<&HostPort>,
+    cmd: Option<&str>,
+    cancel_rx: Receiver<()>,
+) -> Result<(), Box<dyn Error>> {
+    let session = {
+        let session_guard = config.shared_session.lock().unwrap();
+        match &*session_guard {
+            Some(session) => session.clone(),
+            None => {
+                error!("No active session available");
+                return Err("No active session available".into());
+            }
+        }
+    };
+
+    let (connection_success, should_heal, current_failures, error_msg_opt) =
+        match connect_to_tunnel_inner(
+            config.ex.clone(),
+            inbound,
+            session,
+            &config.jump_hosts,
+            remote_addr,
+            cmd,
+            cancel_rx,
+        )
+        .await
+        {
+            Ok(_) => {
+                // Reset failure counter on successful connection
+                let mut counter = config.failure_counter.lock().unwrap();
+                *counter = 0;
+                (true, false, 0, None)
+            }
+            Err(e) => {
+                let error_str = e.to_string();
+                let is_healable = should_trigger_session_healing(&*e);
+
+                if is_healable {
+                    warn!("Connection failed with healable error: {}", error_str);
+
+                    // Increment failure counter
+                    let current_failures = {
+                        let mut counter = config.failure_counter.lock().unwrap();
+                        *counter += 1;
+                        *counter
+                    };
+                    (false, true, current_failures, Some(error_str))
+                } else {
+                    // Reset failure counter for non-healable errors
+                    let mut counter = config.failure_counter.lock().unwrap();
+                    *counter = 0;
+                    (false, false, 0, Some(error_str))
+                }
+            }
+        };
+
+    // Handle healing outside the match to avoid Send issues
+    if should_heal && current_failures >= 2 {
+        warn!(
+            "Multiple connection failures detected ({}), triggering immediate session healing",
+            current_failures
+        );
+
+        if let Err(heal_error) = heal_session_with_retry(
+            &config.shared_session,
+            config.ex.clone(),
+            &config.jump_hosts,
+            &config.creds,
+            config.tunnel_cancel_tx.clone(),
+            3,
+        )
+        .await
+        {
+            let heal_error_str = heal_error.to_string();
+            error!("Immediate session healing failed: {}", heal_error_str);
+        } else {
+            // Reset failure counter on successful healing
+            let mut counter = config.failure_counter.lock().unwrap();
+            *counter = 0;
+            info!("Session healing completed, failure counter reset");
+        }
+    }
+
+    if connection_success {
+        Ok(())
+    } else {
+        Err(error_msg_opt
+            .unwrap_or_else(|| "Unknown connection error".to_string())
+            .into())
+    }
+}
+
+/// Inner tunnel connection logic that handles the actual SSH operations.
+///
+/// This function implements the core SSH tunneling logic for different scenarios:
+///
+/// # Tunneling Scenarios
+///
+/// 1. **No Jump Hosts**: Direct TCP connection to remote address
+/// 2. **Command + Remote Address**: Execute command, wait for service, then connect
+/// 3. **Command Only**: Execute command and tunnel through stdin/stdout
+/// 4. **Remote Address Only**: Connect to existing service through SSH
+///
+/// # Command Execution Flow
+///
+/// When a command is provided, the function:
+/// 1. Creates an SSH execution channel
+/// 2. Executes the specified command
+/// 3. Waits for the service to become available (with retry logic)
+/// 4. Establishes the tunnel connection
+///
+/// # Retry Logic
+///
+/// For command scenarios, implements exponential backoff when waiting
+/// for services to start (up to 10 attempts with increasing delays).
+///
+/// # Type Parameters
+///
+/// * `S` - SSH session stream type
+///
+/// # Arguments
+///
+/// * `ex` - Async executor for spawning tunnel tasks
+/// * `inbound` - Local client connection
+/// * `session` - Authenticated SSH session
+/// * `jump_hosts` - Jump host chain (empty for direct connections)
+/// * `remote_addr` - Target service address
+/// * `cmd` - Command to execute on remote host
+/// * `cancel_rx` - Cancellation receiver
+///
+/// # Returns
+///
+/// * `Ok(())` - Tunnel established successfully
+/// * `Err(Box<dyn Error>)` - Tunnel setup failed
+async fn connect_to_tunnel_inner<S>(
+    ex: Arc<Executor<'_>>,
+    inbound: AsyncTcpStream,
+    session: AsyncSession<S>,
+    jump_hosts: &[HostPort],
+    remote_addr: Option<&HostPort>,
+    cmd: Option<&str>,
+    cancel_rx: Receiver<()>,
+) -> Result<(), Box<dyn Error>>
+where
+    S: AsyncSessionStream + Send + Sync + 'static,
+{
+    if jump_hosts.is_empty() {
+        let socket = remote_addr
+            .expect("Remote address is required when no jump hosts are provided")
+            .to_string()
+            .to_socket_addrs()?
+            .next()
+            .expect("Failed to resolve remote address");
+        let outbound = AsyncTcpStream::connect(socket).await?;
+
+        connect_chain_tunnel(ex, inbound, outbound, cancel_rx).detach();
+        // tokio::spawn(async move {
+        //     let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+        // });
+    } else {
+        info!("Command executed: {}", cmd.unwrap_or("No command provided"));
+        match (cmd, remote_addr) {
+            (Some(cmd), Some(remote_addr)) => {
+                // Execute the command on the remote server and
+                // then assume a local socket is opened to which
+                // we can connect to on the remote_addr.
+                let mut channel = session.channel_session().await?; // dies here
+                info!("SSH channel established ");
+                channel.exec(cmd).await?;
+
+                // Wait for started service to be ready
+                // I know this isn't the cleanest solution
+                // open for suggestions
+                let mut counter = 0;
+                // Use async sleep instead of blocking thread::sleep - increase for iperf3
+                loop {
+                    match session
+                        .channel_direct_tcpip(&remote_addr.host, remote_addr.port, None)
+                        .await
+                    {
+                        Ok(channel) => {
+                            info!("SSH channel established ");
+                            info!("Connected to remote address: {}", remote_addr);
+                            connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
+                            break;
+                        }
+                        Err(err) => {
+                            if counter >= 10 {
+                                error!("Failed to connect to remote address {} after 10 attempts: {err}", remote_addr);
+                                return Err(err.into());
+                            }
+                            counter += 1;
+
+                            // Exponential backoff for high concurrency
+                            let delay = 5 * counter;
+                            error!("remote not ready yet: {err}, retrying in {}ms…", delay);
+                            Timer::after(Duration::from_millis(delay)).await;
+                        }
+                    }
+                }
+            }
+            (Some(cmd), None) => {
+                // Execute the command on the remote server and
+                // then assume since no remote_addr is provided
+                // that communication is done over via stdio over
+                // the channel.
+                let mut channel = session.channel_session().await?;
+                info!("SSH channel established ");
+                channel.exec(cmd).await?;
+                // let exit_code = channel.exit_status().expect("Failed to get exit code");
+                // if exit_code != 0 {
+                //     error!("Command execution failed with exit code: {}", exit_code);
+                // }
+                connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
+            }
+            (None, Some(remote_addr)) => {
+                // It is assumed that after the jumping through the
+                // jump list one is on a host from which the service
+                // is reachable and already running.
+                match session
+                    .channel_direct_tcpip(&remote_addr.host, remote_addr.port, None)
+                    .await
+                {
+                    Ok(channel) => {
+                        info!("SSH channel established ");
+                        info!("Connected to remote address: {}", remote_addr);
+                        connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            (None, None) => {
+                error!("Either a command or a remote address must be provided.");
+                return Err("Either a command or a remote address must be provided.".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Runs the main TCP server that handles incoming connections and forwards them through SSH.
+///
+/// This is the core server function that orchestrates the entire tunneling process.
+/// It handles:
+///
+/// # Server Responsibilities
+///
+/// 1. **TCP Server Management**: Binds to local address and accepts connections
+/// 2. **SSH Session Management**: Establishes and maintains SSH connection chains
+/// 3. **Connection Handling**: Spawns individual tunnel tasks for each client
+/// 4. **Health Monitoring**: Runs background session health checks
+/// 5. **Failure Recovery**: Implements automatic session healing
+/// 6. **Resource Cleanup**: Properly shuts down on cancellation
+///
+/// # Session Health Monitoring
+///
+/// The server runs a background task that:
+/// - Performs health checks every 30 seconds
+/// - Triggers healing for unhealthy sessions
+/// - Manages failure counters and recovery attempts
+/// - Implements exponential backoff for healing attempts
+///
+/// # Connection Lifecycle
+///
+/// For each incoming connection:
+/// 1. Accept the TCP connection
+/// 2. Create tunnel configuration
+/// 3. Spawn async task for tunnel handling
+/// 4. Handle connection through SSH chain
+/// 5. Clean up resources when connection closes
+///
+/// # Graceful Shutdown
+///
+/// The server supports graceful shutdown through the cancellation receiver:
+/// - Stops accepting new connections
+/// - Cancels the health monitoring task
+/// - Cleans up SSH sessions
+/// - Waits for existing connections to complete
+///
+/// # Arguments
+///
+/// * `config` - Complete server configuration including addresses and credentials
+/// * `cancel_rx` - Cancellation receiver for graceful shutdown
+/// * `pair` - Condition variable pair for startup synchronization
+///
+/// # Returns
+///
+/// * `Ok(())` - Server shut down gracefully
+/// * `Err(Box<dyn Error>)` - Server encountered a fatal error
 ///
 /// # Errors
 ///
 /// This function will return an error if:
-///
-/// * Binding to the specified local address fails.
-/// * Accepting incoming connections fails.
-/// * Establishing an SSH session to any of the jump hosts fails.
-/// * Forwarding data between the local connection and the SSH channel fails.
+/// - Local address binding fails
+/// - Initial SSH session establishment fails
+/// - Critical connection acceptance errors occur
+/// - Session cleanup fails during shutdown
 ///
 async fn run_server(
-    addr: &str,
-    jump_hosts: Vec<String>,
-    remote_addr: Option<&str>,
-    cmd: Option<&str>,
-    creds: YamlCreds,
-    cancel_token: CancellationToken,
+    config: ServerConfig,
+    cancel_rx: Receiver<()>,
     pair: Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<(), Box<dyn Error>> {
-    let listener = TcpListener::bind(addr).await?;
-    info!("Listening on {addr}");
+    let listener = AsyncTcpListener::bind(config.addr.parse::<SocketAddr>()?)?;
+    info!("Listening on {}", config.addr);
     {
         let (lock, cvar) = &*pair;
         let mut pending = lock.lock().unwrap();
@@ -367,109 +1273,180 @@ async fn run_server(
         // We notify the condvar that the value has changed.
         cvar.notify_one();
     }
+    let remote_addr = config.remote_addr.as_ref();
+    let (tunnel_cancel_tx, tunnel_cancel_rx) = async_channel::unbounded();
+    let initial_session = connect_chain(
+        config.ex.clone(),
+        &config.jump_hosts,
+        &config.creds,
+        tunnel_cancel_tx.clone(),
+    )
+    .await?;
+    let shared_session: SharedSession = Arc::new(Mutex::new(Some(initial_session)));
+    let failure_counter: FailureCounter = Arc::new(Mutex::new(0));
+    info!("SSH session established");
+
+    // Start session health monitor
+    let session_monitor = {
+        let shared_session_clone = shared_session.clone();
+        let failure_counter_clone = failure_counter.clone();
+        let ex_clone = config.ex.clone();
+        let jump_hosts_clone = config.jump_hosts.clone();
+        let creds_clone = config.creds.clone();
+        let tunnel_cancel_tx_clone = tunnel_cancel_tx.clone();
+
+        config.ex.spawn(async move {
+            let mut healing_in_progress = false;
+            let mut consecutive_failures = 0u32;
+
+            loop {
+                Timer::after(Duration::from_secs(30)).await;
+
+                if healing_in_progress {
+                    continue;
+                }
+
+                let session_healthy = {
+                    let session_opt = {
+                        let session_guard = shared_session_clone.lock().unwrap();
+                        session_guard.clone()
+                    };
+
+                    match session_opt {
+                        Some(session) => is_session_healthy(&session).await,
+                        None => false,
+                    }
+                };
+
+                if !session_healthy {
+                    #[allow(unused_assignments)]
+                    // Value read in next loop iteration to prevent concurrent healing
+                    {
+                        healing_in_progress = true;
+                    }
+                    consecutive_failures += 1;
+
+                    warn!(
+                        "Session health check failed, attempting healing (failure #{})",
+                        consecutive_failures
+                    );
+
+                    match heal_session_with_retry(
+                        &shared_session_clone,
+                        ex_clone.clone(),
+                        &jump_hosts_clone,
+                        &creds_clone,
+                        tunnel_cancel_tx_clone.clone(),
+                        3,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            info!("Session health monitor: healing successful");
+                            consecutive_failures = 0;
+                        }
+                        Err(e) => {
+                            error!("Session health monitor: healing failed: {}", e);
+                        }
+                    }
+
+                    healing_in_progress = false;
+                } else {
+                    consecutive_failures = 0;
+                    // Decay the failure counter over time if session is healthy
+                    let mut counter = failure_counter_clone.lock().unwrap();
+                    if *counter > 0 {
+                        *counter = (*counter).saturating_sub(1);
+                        if *counter == 0 {
+                            info!(
+                                "Failure counter decayed to 0, connection issues may be resolved"
+                            );
+                        }
+                    }
+                }
+            }
+        })
+    };
     loop {
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
+        select! {
+            _ = cancel_rx.recv().fuse() => {
                 warn!("Shutdown signal received. Stopping server.");
                 break;
             }
-            result = listener.accept() => {
-                match result {
-                    Ok((mut inbound, _)) => {
-                        if jump_hosts.is_empty() {
-                            let remote_socket_addr = remote_addr
-                                .ok_or("Remote address is required when no jump hosts are provided")?
-                                .to_socket_addrs()?
-                                .next()
-                                .ok_or("Failed to resolve remote address")?;
-                            let mut outbound = TcpStream::connect(remote_socket_addr).await?;
-                            tokio::spawn(async move {
-                                if let Err(e) = copy_bidirectional(&mut inbound, &mut outbound).await {
-                                    error!("Connection error: {e}");
-                                }
-                            });
+            sock_result = listener.accept().fuse() => {
+                let sock = match sock_result {
+                    Ok((sock, _)) => sock,
+                    Err(e) => {
+                        error!("Failed to accept connection: {e}");
+                        return Err(e.into());
+                    }
+                };
+
+                // Handle each connection in a separate task
+                let tunnel_config = TunnelConfig {
+                    ex: config.ex.clone(),
+                    shared_session: shared_session.clone(),
+                    jump_hosts: config.jump_hosts.clone(),
+                    creds: config.creds.clone(),
+                    failure_counter: failure_counter.clone(),
+                    tunnel_cancel_tx: tunnel_cancel_tx.clone(),
+                };
+                let remote_addr_clone = remote_addr.cloned();
+                let cmd_clone = config.cmd.clone();
+                let tunnel_rx = tunnel_cancel_rx.clone();
+
+                config.ex.spawn(async move {
+                    match connect_to_tunnel(
+                        &tunnel_config,
+                        sock,
+                        remote_addr_clone.as_ref(),
+                        cmd_clone.as_deref(),
+                        tunnel_rx,
+                    ).await {
+                        Ok(_) => {
+                            info!("Connection handled successfully");
                         }
-                        else{
-                            let session = connect_chain(&jump_hosts, &creds).await?;
-                            let mut channel  = session.channel_session().await?;
-                            info!("Command executed: {}", cmd.unwrap_or("No command provided"));
-                            match (cmd, remote_addr) {
-                                (Some(cmd), Some(remote_addr)) => {
-                                    // Execute the command on the remote server and
-                                    // then assume a local socket is opened to which
-                                    // we can connect to on the remote_addr.
-                                    channel.exec(cmd).await?;
-                                    let exit_code = channel.exit_status().expect("Failed to get exit code");
-                                    if exit_code != 0 {
-                                        error!("Command execution failed with exit code: {}", exit_code);
-                                    }
-                                    let remote_socket_addr = remote_addr
-                                        .to_socket_addrs()?
-                                        .next()
-                                        .ok_or("Failed to resolve remote address")?;
-                                    let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
-                                    info!("Connected to remote address: {}", remote_addr);
-                                    tokio::spawn(async move {
-                                        if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                            error!("Connection error: {e}");
-                                        }
-                                    });
-                                }
-                                (Some(cmd), None) => {
-                                    // Execute the command on the remote server and
-                                    // then assume since no remote_addr is provided
-                                    // that communication is done over via stdio over
-                                    // the channel.
-                                    channel.exec(cmd).await?;
-                                    let exit_code = channel.exit_status().expect("Failed to get exit code");
-                                    if exit_code != 0 {
-                                        error!("Command execution failed with exit code: {}", exit_code);
-                                    }
-                                    tokio::spawn(async move {
-                                        if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                            error!("Connection error: {e}");
-                                        }
-                                    });
-                                    continue;
-                                }
-                                (None, Some(remote_addr)) => {
-                                    // It is assumed that after the jumping through the
-                                    // jump list one is on a host from which the service
-                                    // is reachable and already running.
-                                    let remote_socket_addr = remote_addr
-                                        .to_socket_addrs()?
-                                        .next()
-                                        .ok_or("Failed to resolve remote address")?;
-                                    let mut channel  = session.channel_direct_tcpip(&remote_socket_addr.ip().to_string(), remote_socket_addr.port(), None).await?;
-                                    info!("Connected to remote address: {}", remote_addr);
-                                    tokio::spawn(async move {
-                                        if let Err(e) = copy_bidirectional(&mut inbound, &mut channel).await {
-                                            error!("Connection error: {e}");
-                                        }
-                                    });
-                                    continue
-                                }
-                                (None, None) => {
-                                    error!("Either a command or a remote address must be provided.");
-                                    return Err("Either a command or a remote address must be provided.".into());
-                                }
-                            }
+                        Err(e) => {
+                            error!("Failed to handle connection: {e}");
                         }
                     }
-                    Err(e) => error!("Failed to accept connection: {e}")
-                }
+                }).detach();
             }
         }
     }
+
+    session_monitor.cancel().await;
+    cleanup_session(&shared_session).await?;
     Ok(())
 }
 
-/// Checks if the `sops` binary is available in the system's PATH and returns its path if found.
+/// Locates the SOPS binary in the system's PATH.
+///
+/// SOPS (Secrets OPerationS) is required for decrypting credential files.
+/// This function searches the system PATH for the sops executable,
+/// handling both Unix-style and Windows-style executable names.
+///
+/// # Search Strategy
+///
+/// 1. Retrieve the system PATH environment variable
+/// 2. Iterate through each directory in PATH
+/// 3. Check for 'sops' (Unix/Linux/macOS) or 'sops.exe' (Windows)
+/// 4. Return the first valid executable found
 ///
 /// # Returns
 ///
-/// * `Ok(String)` - The absolute path to the `sops` binary.
-/// * `Err(String)` - An error message indicating that `sops` was not found.
+/// * `Ok(String)` - Absolute path to the sops binary
+/// * `Err(String)` - Error message if sops is not found
+///
+/// # Platform Support
+///
+/// - **Unix/Linux/macOS**: Looks for 'sops'
+/// - **Windows**: Looks for 'sops.exe'
+///
+/// # Prerequisites
+///
+/// The sops binary must be installed and accessible in the system PATH.
+/// Installation instructions are available at: https://github.com/mozilla/sops
 fn find_sops_binary() -> Result<String, String> {
     // Retrieve the system's PATH environment variable
     if let Ok(paths) = std::env::var("PATH") {
@@ -576,6 +1553,23 @@ pub fn bind(
         return;
     }
 
+    let jump_hosts: Vec<HostPort> = jump_hosts
+        .iter()
+        .map(|host| HostPort::try_from(host.as_str()))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| {
+            error!("Failed to parse jump hosts: {}", e);
+            panic!("Invalid jump host, doesn't conform to URI format of RFC 3986 / RFC 7230 / RFC 9110");
+        });
+
+    let remote_addr = remote_addr
+        .map(|addr| HostPort::try_from(addr.as_str()))
+        .transpose()
+        .unwrap_or_else(|e| {
+            error!("Failed to parse remote address: {}", e);
+            panic!("Invalid remote address, doesn't conform to URI format of RFC 3986 / RFC 7230 / RFC 9110");
+        });
+
     let creds: YamlCreds = match serde_yml::from_str(&String::from_utf8_lossy(&output.stdout)) {
         Ok(creds) => creds,
         Err(e) => {
@@ -584,33 +1578,44 @@ pub fn bind(
         }
     };
 
-    let cancel_token = CancellationToken::new();
-    let token_clone = cancel_token.clone();
+    let (cancel_tx, cancel_rx) = async_channel::unbounded();
     let bind_addr = addr.to_string();
 
     let pair = Arc::new((Mutex::new(true), Condvar::new()));
     let pair_clone = Arc::clone(&pair);
 
     let handle = thread::spawn(move || {
-        let rt = Runtime::new().unwrap();
-        rt.block_on(async {
-            if let Err(e) = run_server(
-                &bind_addr,
-                jump_hosts,
-                remote_addr.as_deref(),
-                cmd.as_deref(),
-                creds,
-                token_clone,
-                pair_clone,
-            )
-            .await
-            {
-                error!("Server error: {e}");
-            }
-        });
+        use async_executor::{Executor, LocalExecutor};
+        use easy_parallel::Parallel;
+        use futures::executor::block_on;
+
+        let ex = Arc::new(Executor::new());
+        let local_ex = LocalExecutor::new();
+        let (trigger, shutdown) = async_channel::unbounded::<()>();
+
+        let _result = Parallel::new()
+            .each(0..4, |_| block_on(ex.run(async { shutdown.recv().await })))
+            .finish(|| {
+                block_on(local_ex.run(async {
+                    let server_config = ServerConfig {
+                        ex: ex.clone(),
+                        addr: bind_addr.clone(),
+                        jump_hosts,
+                        remote_addr,
+                        cmd: cmd.clone(),
+                        creds,
+                    };
+
+                    if let Err(e) = run_server(server_config, cancel_rx, pair_clone).await {
+                        error!("Server error: {e}");
+                    }
+
+                    drop(trigger);
+                }))
+            });
     });
 
-    binds.insert(addr.to_string(), (cancel_token, handle));
+    binds.insert(addr.to_string(), (cancel_tx, handle));
 
     // Wait for the thread to start up, bind and listen.
     let (lock, cvar) = &*pair;
@@ -622,45 +1627,99 @@ pub fn bind(
 /// A map of credentials loaded from a YAML file.
 pub type YamlCreds = BTreeMap<String, Creds>;
 
-/// Credentials required for SSH authentication.
+/// SSH authentication credentials for a single host.
+///
+/// This structure contains all the authentication information needed
+/// to connect to an SSH server, including optional TOTP support for
+/// two-factor authentication scenarios.
+///
+/// # Security Notes
+///
+/// These credentials are loaded from SOPS-encrypted files and should
+/// never be stored in plaintext. The TOTP key, when present, should
+/// be a base32-encoded secret as provided by the 2FA system.
+///
+/// # TOTP Key Format
+///
+/// The TOTP key should be in base32 format without padding, as typically
+/// provided by authenticator applications or when setting up 2FA.
+///
+/// # Examples
+///
+/// ```yaml
+/// # In SOPS-encrypted credentials file:
+/// example.com:22:
+///   username: "myuser"
+///   password: "mypassword"
+///   totp_key: "JBSWY3DPEHPK3PXP"  # base32 encoded
+/// ```
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Creds {
-    /// SSH username.
+    /// SSH username for authentication
     pub username: String,
-    /// SSH password.
+    /// SSH password for authentication
     pub password: String,
-    /// Optional base32 TOTP key for two-factor authentication.
+    /// Optional base32-encoded TOTP secret key for 2FA
     pub totp_key: Option<String>,
 }
 
 #[allow(clippy::type_complexity)]
-static BINDINGS: LazyLock<
-    Mutex<HashMap<String, (CancellationToken, std::thread::JoinHandle<()>)>>,
-> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static BINDINGS: LazyLock<Mutex<HashMap<String, (Sender<()>, std::thread::JoinHandle<()>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Unbinds a previously established binding for the given address.
+/// Gracefully shuts down a previously established SSH tunnel binding.
 ///
-/// This function cancels the running server associated with the provided address
-/// and waits for its thread to finish. If the address is not found in the bindings,
-/// a warning is logged.
+/// This function performs a clean shutdown of the server associated with
+/// the specified address. It signals cancellation to the server thread
+/// and waits for all resources to be properly cleaned up.
+///
+/// # Shutdown Process
+///
+/// 1. Look up the binding in the global bindings map
+/// 2. Send cancellation signal to the server thread
+/// 3. Close the cancellation channel to stop accepting new connections
+/// 4. Wait for the server thread to complete cleanup
+/// 5. Remove the binding from the global map
+///
+/// # Resource Cleanup
+///
+/// The shutdown process ensures that:
+/// - All active SSH sessions are properly disconnected
+/// - TCP listeners are closed
+/// - Background monitoring tasks are cancelled
+/// - Thread resources are reclaimed
 ///
 /// # Arguments
 ///
-/// * `addr` - The address of the binding to unbind.
+/// * `addr` - The local address of the binding to shut down
 ///
-/// # Example
+/// # Examples
 ///
-/// ```
-/// use sshbind::unbind;
+/// ```rust,no_run
+/// use sshbind::{bind, unbind};
 ///
+/// // Start a tunnel
+/// bind("127.0.0.1:8000",
+///      vec!["jump1:22".to_string()],
+///      Some("service:80".to_string()),
+///      "creds.yaml",
+///      None);
+///
+/// // Later, shut it down cleanly
 /// unbind("127.0.0.1:8000");
 /// ```
+///
+/// # Behavior
+///
+/// - If the address is not found in active bindings, logs a warning
+/// - Blocks until the server thread completes shutdown
+/// - Thread join failures are logged but do not panic
 pub fn unbind(addr: &str) {
     let mut binds = BINDINGS.lock().unwrap();
-    if let Some((cancel_token, handle)) = binds.remove(addr) {
+    if let Some((cancel_tx, handle)) = binds.remove(addr) {
         info!("Destructing binding on {}", addr);
         info!("Signaling cancellation...");
-        cancel_token.cancel();
+        cancel_tx.close();
         if let Err(e) = handle.join() {
             error!("Failed to join thread for {}: {:?}", addr, e);
         } else {
