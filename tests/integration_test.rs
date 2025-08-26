@@ -126,7 +126,10 @@ async fn test_correct_configuration() -> Result<(), Box<dyn std::error::Error>> 
         cleanup.add_ssh_task(task);
     }
 
-    // Give SSH servers time to start up
+    // Give SSH servers more time to start up on Windows
+    #[cfg(windows)]
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    #[cfg(not(windows))]
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     info!("SSH servers started");
     let service_handle = task::spawn(async move {
@@ -230,6 +233,9 @@ async fn test_correct_configuration_multiple() -> Result<(), Box<dyn std::error:
     let service_addr_consume = ports.service_addr();
     let service_addr = Some(service_addr_consume.clone());
 
+    // Set up cleanup handler to ensure cleanup happens even on test failure
+    let mut cleanup = helpers::TestCleanup::new(bind_addr.clone());
+
     let ssh_tasks: Vec<_> = jump_hosts
         .clone()
         .into_iter()
@@ -244,8 +250,18 @@ async fn test_correct_configuration_multiple() -> Result<(), Box<dyn std::error:
         })
         .collect();
 
-    // Give SSH servers time to start up
+    // Register SSH tasks with cleanup handler
+    for task in &ssh_tasks {
+        cleanup.add_ssh_task(task);
+    }
+
+    // Give SSH servers more time to start up on Windows
+    #[cfg(windows)]
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
+    #[cfg(not(windows))]
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
     let service_handle = task::spawn(async move {
         let serv = TcpListener::bind(service_addr_consume).await.unwrap();
         loop {
@@ -253,6 +269,9 @@ async fn test_correct_configuration_multiple() -> Result<(), Box<dyn std::error:
             socket.write_all(b"hello world!").await.unwrap();
         }
     });
+
+    // Register service handle with cleanup handler
+    cleanup.set_service_handle(&service_handle);
 
     bind(
         &bind_addr,
@@ -276,11 +295,9 @@ async fn test_correct_configuration_multiple() -> Result<(), Box<dyn std::error:
     println!("Received: {}", response);
     assert_eq!(response, "hello world!");
 
-    unbind(&bind_addr);
-    for task in ssh_tasks {
-        task.abort();
-    }
-    service_handle.abort();
+    // Cleanup will be handled automatically by the Drop implementation
+    // but we can also call it explicitly if desired
+    cleanup.cleanup();
     Ok(())
 }
 
@@ -351,6 +368,9 @@ async fn test_second_server_wrong_credentials() -> Result<(), Box<dyn std::error
     let service_addr_consume = ports.service_addr();
     let service_addr = Some(service_addr_consume.clone());
 
+    // Set up cleanup handler to ensure cleanup happens even on test failure
+    let mut cleanup = helpers::TestCleanup::new(bind_addr.clone());
+
     let ssh_tasks: Vec<_> = jump_hosts
         .clone()
         .into_iter()
@@ -371,7 +391,15 @@ async fn test_second_server_wrong_credentials() -> Result<(), Box<dyn std::error
         })
         .collect();
 
-    // Give SSH servers time to start up
+    // Register SSH tasks with cleanup handler
+    for task in &ssh_tasks {
+        cleanup.add_ssh_task(task);
+    }
+
+    // Give SSH servers more time to start up on Windows
+    #[cfg(windows)]
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    #[cfg(not(windows))]
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let service_handle = task::spawn(async move {
         let serv = TcpListener::bind(service_addr_consume).await.unwrap();
@@ -380,6 +408,8 @@ async fn test_second_server_wrong_credentials() -> Result<(), Box<dyn std::error
             socket.write_all(b"hello world!").await.unwrap();
         }
     });
+
+    cleanup.set_service_handle(&service_handle);
 
     bind(
         &bind_addr,
@@ -412,11 +442,8 @@ async fn test_second_server_wrong_credentials() -> Result<(), Box<dyn std::error
         }
     }
 
-    unbind(&bind_addr);
-    for task in ssh_tasks {
-        task.abort();
-    }
-    service_handle.abort();
+    // Cleanup will be handled automatically by the Drop implementation
+    cleanup.cleanup();
     Ok(())
 }
 
@@ -473,6 +500,9 @@ async fn test_correct_configuration_2fa() -> Result<(), Box<dyn std::error::Erro
     let service_addr_consume = ports.service_addr();
     let service_addr = Some(service_addr_consume.clone());
 
+    // Set up cleanup handler to ensure cleanup happens even on test failure
+    let mut cleanup = helpers::TestCleanup::new(bind_addr.clone());
+
     let ssh_tasks: Vec<_> = jump_hosts
         .clone()
         .into_iter()
@@ -487,7 +517,15 @@ async fn test_correct_configuration_2fa() -> Result<(), Box<dyn std::error::Erro
         })
         .collect();
 
-    // Give SSH servers time to start up
+    // Register SSH tasks with cleanup handler
+    for task in &ssh_tasks {
+        cleanup.add_ssh_task(task);
+    }
+
+    // Give SSH servers more time to start up on Windows
+    #[cfg(windows)]
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    #[cfg(not(windows))]
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     let service_handle = task::spawn(async move {
         let serv = TcpListener::bind(service_addr_consume).await.unwrap();
@@ -496,6 +534,9 @@ async fn test_correct_configuration_2fa() -> Result<(), Box<dyn std::error::Erro
             socket.write_all(b"hello world!").await.unwrap();
         }
     });
+
+    // Register service handle with cleanup handler
+    cleanup.set_service_handle(&service_handle);
 
     bind(
         &bind_addr,
@@ -512,11 +553,8 @@ async fn test_correct_configuration_2fa() -> Result<(), Box<dyn std::error::Erro
     println!("Received: {}", response);
     assert_eq!(response, "hello world!");
 
-    unbind(&bind_addr);
-    for task in ssh_tasks {
-        task.abort();
-    }
-    service_handle.abort();
+    // Cleanup will be handled automatically by the Drop implementation
+    cleanup.cleanup();
     Ok(())
 }
 
