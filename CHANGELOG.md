@@ -7,6 +7,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.1] - 2025-01-26
+
 ### Added
 
 - GitHub Actions workflow for publishing to crates.io
@@ -83,4 +85,5 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 [0.0.2]: https://github.com/Xyhlon/SSHBind/compare/v0.0.1...v0.0.2
 [0.0.3]: https://github.com/Xyhlon/SSHBind/compare/v0.0.2...v0.0.3
 [0.1.0]: https://github.com/Xyhlon/SSHBind/compare/v0.0.3...v0.1.0
-[unreleased]: https://github.com/Xyhlon/SSHBind/compare/v0.1.0...HEAD
+[0.1.1]: https://github.com/Xyhlon/SSHBind/compare/v0.1.0...v0.1.1
+[unreleased]: https://github.com/Xyhlon/SSHBind/compare/v0.1.1...HEAD
