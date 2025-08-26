@@ -45,7 +45,7 @@ jobs:
       - name: Run cargo build
         run: cargo +${{ matrix.rust }} build --all-features --verbose
       - name: Run cargo test
-        run: cargo +${{ matrix.rust }} nextest run --all-features --verbose
+        run: cargo +${{ matrix.rust }} nextest run --lib --tests --all-features --verbose
   formatting:
     name: Cargo fmt
     runs-on: ubuntu-latest

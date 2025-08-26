@@ -1,3 +1,65 @@
+//! # SSHBind Library
+//!
+//! SSHBind is a Rust library that enables developers to programmatically bind services
+//! located behind multiple SSH connections to a local socket. This facilitates secure and
+//! seamless access to remote services, even those that are otherwise unreachable.
+//!
+//! ## Features
+//!
+//! - **Multiple Jump Host Support**: Navigate through a series of SSH jump hosts to reach
+//!   the target service
+//! - **Local Socket Binding**: Expose remote services on local sockets, making them
+//!   accessible as if they were running locally
+//! - **Encrypted Credential Management**: Utilize SOPS-encrypted YAML files for secure
+//!   credential storage
+//! - **TOTP-based 2FA Support**: Programmatic two-factor authentication using time-based
+//!   one-time passwords
+//! - **Automatic Reconnection**: Seamlessly handle connection interruptions by
+//!   automatically reconnecting to services
+//! - **Session Reuse**: Efficiently reuse SSH sessions to avoid overwhelming SSH servers
+//!
+//! ## Platform Support
+//!
+//! - **Library**: Supports macOS, Linux, and Windows
+//! - **CLI Application**: Currently supported on Linux and Windows only
+//!
+//! ## Basic Usage
+//!
+//! ```rust,no_run
+//! use sshbind::{bind, unbind};
+//!
+//! // Bind a remote service to a local address
+//! let local_addr = "127.0.0.1:8000";
+//! let jump_hosts = vec!["jump1:22".to_string(), "jump2:22".to_string()];
+//! let remote_addr = Some("remote.service:80".to_string());
+//! let sopsfile = "secrets.yaml";
+//!
+//! bind(local_addr, jump_hosts, remote_addr, sopsfile, None);
+//!
+//! // Use the bound service...
+//!
+//! // Unbind when done
+//! unbind(local_addr);
+//! ```
+//!
+//! ## Credential Management
+//!
+//! Credentials are stored in SOPS-encrypted YAML files with the following structure:
+//!
+//! ```yaml
+//! host:22:  # hostname:port format
+//!   username: your_username
+//!   password: your_password
+//!   totp_key: optional_base32_totp_key  # For 2FA
+//! ```
+//!
+//! ## Architecture Notes
+//!
+//! - SSH sessions are reused across multiple connections to prevent overwhelming SSH servers
+//! - The library implements automatic session healing when connection issues are detected
+//! - All connections are handled asynchronously using the async/await model
+//! - Background monitoring ensures session health and triggers reconnections when needed
+
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 use std::error::Error;
@@ -26,18 +88,32 @@ use futures::{select, AsyncReadExt, AsyncWriteExt};
 // use futures_lite::future;
 use std::net::{TcpListener as StdTcpListener, TcpStream};
 
-#[cfg(not(unix))]
-use async_io::Async as AsyncTcpListener;
-
 use log::{error, info, warn};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 type AsyncTcpStream = Async<TcpStream>;
 type AsyncTcpListener = Async<StdTcpListener>;
 
+/// Represents a host and port combination for SSH connections.
+///
+/// This structure is used throughout the library to represent network endpoints
+/// for SSH connections, including jump hosts and target services.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::convert::TryFrom;
+/// use sshbind::HostPort;
+///
+/// let host_port = HostPort::try_from("example.com:22").unwrap();
+/// assert_eq!(host_port.host, "example.com");
+/// assert_eq!(host_port.port, 22);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostPort {
+    /// The hostname or IP address
     pub host: String,
+    /// The port number
     pub port: u16,
 }
 
@@ -86,6 +162,19 @@ impl From<HostPort> for SocketAddr {
     }
 }
 
+/// Handles TOTP-based keyboard-interactive authentication prompts.
+///
+/// This handler automatically responds to SSH keyboard-interactive authentication
+/// prompts by detecting the type of prompt (username, password, or TOTP code)
+/// and providing the appropriate response from the stored credentials.
+///
+/// # Authentication Flow
+///
+/// The handler uses pattern matching on prompt text to determine the response:
+/// - Prompts containing "user" → responds with username
+/// - Prompts containing "pass" → responds with password
+/// - Prompts containing "otp", "2fa", "one", "time", "code", or "token" → generates TOTP code
+/// - Other prompts → responds with empty string
 pub struct TotpPromptHandler {
     creds: Creds,
 }
@@ -136,7 +225,11 @@ impl KeyboardInteractivePrompt for TotpPromptHandler {
     }
 }
 
-/// Represents the standard SSH authentication methods.
+/// Represents the standard SSH authentication methods as defined in RFC 4252.
+///
+/// These authentication methods are tried in the order specified by the SSH server's
+/// `ssh-userauth` response. The library supports password, keyboard-interactive,
+/// and public key authentication methods.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum AuthMethod {
     Password,
@@ -173,15 +266,32 @@ impl fmt::Display for AuthMethod {
     }
 }
 
-/// A parser that preserves the ordering of the allowed authentication methods.
+/// A parser that preserves the ordering of allowed SSH authentication methods.
+///
+/// SSH servers return authentication methods in a comma-separated string. This parser
+/// maintains the server's preferred order while filtering out unsupported methods.
+/// This is crucial for security as servers may have specific authentication flows.
 #[derive(Debug)]
 struct OrderedAuthMethods {
     methods: Vec<AuthMethod>,
 }
 
 impl OrderedAuthMethods {
-    /// Parse a comma-separated list of methods (e.g. "password,publickey,hostbased,keyboard-interactive")
-    /// into an OrderedAuthMethods instance that preserves ordering.
+    /// Parses a comma-separated list of authentication methods.
+    ///
+    /// # Arguments
+    ///
+    /// * `methods_str` - Server response string (e.g., "password,publickey,keyboard-interactive")
+    ///
+    /// # Returns
+    ///
+    /// An OrderedAuthMethods instance with supported methods in server-preferred order.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// let methods = OrderedAuthMethods::parse("password,publickey,keyboard-interactive");
+    /// ```
     fn parse(methods_str: &str) -> Self {
         // Split the input string and convert each method into an AuthMethod.
         // Filtering out unsupported ones.
@@ -193,18 +303,41 @@ impl OrderedAuthMethods {
     }
 }
 
-/// Authenticates a user for the given SSH session.
+/// Authenticates a user for the given SSH session using multiple authentication methods.
+///
+/// This function implements a robust authentication flow that:
+/// 1. Queries available authentication methods from the SSH server
+/// 2. Attempts each method in the server's preferred order
+/// 3. Handles partial authentication for multi-factor setups
+/// 4. Supports password, keyboard-interactive, and public key authentication
+/// 5. Automatically generates TOTP codes when required
 ///
 /// # Arguments
 ///
-/// * `session` - A reference to the `AsyncSession` object.
-/// * `creds_map` - A reference to a map containing credentials for each host.
-/// * `host` - The hostname or IP address of the SSH server.
+/// * `session` - The SSH session to authenticate
+/// * `creds_map` - Map of host credentials loaded from SOPS file
+/// * `host` - The target host being authenticated to
 ///
 /// # Returns
 ///
-/// A `Result` indicating success or failure of the authentication process.
+/// * `Ok(())` - Authentication successful
+/// * `Err(Box<dyn Error>)` - Authentication failed or credentials not found
 ///
+/// # Errors
+///
+/// This function will return an error if:
+/// - No credentials are found for the specified host
+/// - All authentication methods fail
+/// - Network errors occur during authentication
+/// - TOTP key is required but not provided
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// let session = AsyncSession::new(stream, config)?;
+/// session.handshake().await?;
+/// userauth(&session, &creds_map, &host).await?;
+/// ```
 async fn userauth(
     session: &AsyncSession<AsyncTcpStream>,
     creds_map: &YamlCreds,
@@ -344,6 +477,36 @@ async fn userauth(
     }
 }
 
+/// Creates a bidirectional data tunnel between two async streams.
+///
+/// This function establishes a high-performance bidirectional data bridge between
+/// two async streams, copying data in both directions simultaneously. It uses
+/// 16KB buffers for efficient data transfer and handles connection errors gracefully.
+///
+/// # Type Parameters
+///
+/// * `A` - First stream type (must implement AsyncReadExt + AsyncWriteExt + Unpin + Send)
+/// * `B` - Second stream type (must implement AsyncReadExt + AsyncWriteExt + Unpin + Send)
+///
+/// # Arguments
+///
+/// * `ex` - Async executor for spawning the tunnel task
+/// * `a` - First stream (typically the local connection)
+/// * `b` - Second stream (typically the SSH channel)
+/// * `_cancel_rx` - Cancellation receiver (currently unused, reserved for future use)
+///
+/// # Returns
+///
+/// A detached task that runs the bidirectional tunnel until either:
+/// - One of the streams closes (EOF)
+/// - A network error occurs
+/// - The streams are disconnected
+///
+/// # Performance Notes
+///
+/// - Uses 16KB buffers for optimal throughput
+/// - Handles both streams concurrently using async select
+/// - Gracefully handles broken pipes and connection resets
 fn connect_chain_tunnel<A, B>(
     ex: Arc<Executor<'_>>,
     mut a: A,
@@ -409,22 +572,57 @@ where
     })
 }
 
-/// Establishes an SSH session chain through the given jump hosts.
+/// Establishes an SSH session chain through multiple jump hosts.
+///
+/// This is a critical function that creates a series of SSH connections through
+/// multiple jump hosts to reach a final destination. Each connection in the chain
+/// uses the previous connection as a tunnel, creating a secure path through
+/// multiple network segments.
+///
+/// # Connection Process
+///
+/// 1. Connect directly to the first jump host
+/// 2. For each subsequent jump host:
+///    - Create an SSH channel through the current session
+///    - Set up a local bridge listener
+///    - Connect through the bridge to establish the next hop
+///    - Authenticate to the new host
+///
+/// # Session Reuse Policy
+///
+/// **CRITICAL**: This function reuses SSH sessions to prevent overwhelming SSH servers.
+/// Creating new sessions for each connection could trigger rate limiting or DDoS
+/// protection mechanisms. Session reuse is mandatory and must not be violated.
 ///
 /// # Arguments
 ///
-/// * `jump_hosts` - A slice of strings representing the jump host addresses.
-/// * `creds_map` - A reference to a map containing credentials for each host.
+/// * `ex` - Async executor for managing connection tasks
+/// * `jump_hosts` - Ordered list of jump hosts to traverse
+/// * `creds_map` - SSH credentials for each host
+/// * `_cancel_tx` - Cancellation channel (reserved for future use)
 ///
 /// # Returns
 ///
-/// A `Result` containing the final `AsyncSession` connected to the last host in the chain,
-/// or an error if the connection fails.
+/// * `Ok(AsyncSession)` - Authenticated session to the final jump host
+/// * `Err(Box<dyn Error>)` - Connection or authentication failure
+///
+/// # Errors
+///
+/// This function will return an error if:
+/// - No jump hosts are provided (assertion failure)
+/// - Any SSH connection fails
+/// - Authentication to any host fails
+/// - Network bridges cannot be established
+/// - Channel creation fails
 ///
 type SharedSession = Arc<Mutex<Option<AsyncSession<AsyncTcpStream>>>>;
 type FailureCounter = Arc<Mutex<u32>>;
 
-/// Configuration for tunnel connections
+/// Configuration for individual tunnel connections.
+///
+/// This structure contains all the necessary components for establishing
+/// and managing a single tunnel connection through the SSH chain.
+/// It includes session management, failure tracking, and cancellation support.
 #[derive(Clone)]
 struct TunnelConfig {
     ex: Arc<Executor<'static>>,
@@ -435,7 +633,11 @@ struct TunnelConfig {
     tunnel_cancel_tx: Sender<()>,
 }
 
-/// Configuration for the server
+/// Configuration for the main TCP server.
+///
+/// This structure holds all the parameters needed to run the main TCP server
+/// that accepts incoming connections and forwards them through SSH tunnels.
+/// It includes the binding address, jump host chain, and credential information.
 struct ServerConfig {
     ex: Arc<Executor<'static>>,
     addr: String,
@@ -445,6 +647,20 @@ struct ServerConfig {
     creds: YamlCreds,
 }
 
+/// Safely cleans up an existing SSH session.
+///
+/// This function properly disconnects and cleans up an SSH session that may
+/// be in an unhealthy state. It's used as part of the session healing process
+/// to ensure clean state before establishing a new connection.
+///
+/// # Arguments
+///
+/// * `shared_session` - Shared reference to the session to clean up
+///
+/// # Returns
+///
+/// * `Ok(())` - Session cleaned up successfully
+/// * `Err(Box<dyn Error>)` - Cleanup operation failed
 async fn cleanup_session(shared_session: &SharedSession) -> Result<(), Box<dyn Error>> {
     info!("Starting session cleanup");
     let session_opt = {
@@ -462,6 +678,27 @@ async fn cleanup_session(shared_session: &SharedSession) -> Result<(), Box<dyn E
     Ok(())
 }
 
+/// Rebuilds an SSH session chain after connection failure.
+///
+/// This function performs a complete session rebuild by:
+/// 1. Cleaning up the existing (failed) session
+/// 2. Establishing a new connection chain through all jump hosts
+/// 3. Updating the shared session reference
+///
+/// This is used by the session healing mechanism when connection issues are detected.
+///
+/// # Arguments
+///
+/// * `shared_session` - Shared session reference to rebuild
+/// * `ex` - Async executor for connection tasks
+/// * `jump_hosts` - List of jump hosts to reconnect through
+/// * `creds_map` - SSH credentials for authentication
+/// * `cancel_tx` - Cancellation channel for the new session
+///
+/// # Returns
+///
+/// * `Ok(())` - Session rebuilt successfully
+/// * `Err(Box<dyn Error>)` - Rebuild failed
 async fn rebuild_session(
     shared_session: &SharedSession,
     ex: Arc<Executor<'_>>,
@@ -484,6 +721,36 @@ async fn rebuild_session(
     Ok(())
 }
 
+/// Heals a failed SSH session with exponential backoff retry logic.
+///
+/// This function implements a robust session healing mechanism that attempts
+/// to rebuild failed SSH connections with intelligent retry logic:
+///
+/// - Exponential backoff delays (capped at 30 seconds)
+/// - Configurable maximum retry attempts
+/// - Detailed logging of each attempt
+/// - Complete session rebuild on each retry
+///
+/// # Retry Strategy
+///
+/// - Attempt 1: Immediate
+/// - Attempt 2: 1 second delay
+/// - Attempt 3: 2 second delay
+/// - Attempt 4+: Exponential backoff up to 30 seconds
+///
+/// # Arguments
+///
+/// * `shared_session` - Session reference to heal
+/// * `ex` - Async executor for connection operations
+/// * `jump_hosts` - Jump host chain to reconnect through
+/// * `creds_map` - Authentication credentials
+/// * `cancel_tx` - Cancellation channel for new connections
+/// * `max_attempts` - Maximum number of retry attempts
+///
+/// # Returns
+///
+/// * `Ok(())` - Session healed successfully
+/// * `Err(Box<dyn Error>)` - All healing attempts failed
 async fn heal_session_with_retry(
     shared_session: &SharedSession,
     ex: Arc<Executor<'_>>,
@@ -581,6 +848,31 @@ async fn connect_chain(
     Ok(session)
 }
 
+/// Determines if an error should trigger automatic session healing.
+///
+/// This function analyzes error messages to determine if they indicate
+/// connection issues that can be resolved by rebuilding the SSH session.
+/// It looks for specific error patterns that suggest network problems,
+/// authentication timeouts, or SSH protocol issues.
+///
+/// # Healable Error Patterns
+///
+/// - "channel session" - SSH channel creation failures
+/// - "connection reset" - Network connection issues
+/// - "broken pipe" - Broken network connections
+/// - "not authenticated" - Authentication state issues
+/// - "session closed" - SSH session termination
+/// - "transport read" - SSH transport layer errors
+/// - "would block" - Non-blocking I/O issues
+///
+/// # Arguments
+///
+/// * `error` - The error to analyze
+///
+/// # Returns
+///
+/// * `true` - Error suggests healing may help
+/// * `false` - Error is not healable through session rebuild
 fn should_trigger_session_healing(error: &dyn Error) -> bool {
     let error_str = error.to_string().to_lowercase();
     error_str.contains("channel session")
@@ -596,6 +888,28 @@ fn should_trigger_session_healing(error: &dyn Error) -> bool {
         || error_str.contains("would block")
 }
 
+/// Performs a health check on an SSH session.
+///
+/// This function tests if an SSH session is still functional by attempting
+/// to create a simple SSH channel. If the channel creation succeeds,
+/// the session is considered healthy. The test channel is properly closed
+/// to avoid resource leaks.
+///
+/// # Health Check Process
+///
+/// 1. Attempt to create a new SSH channel
+/// 2. If successful, immediately close the channel
+/// 3. Wait for channel closure confirmation
+/// 4. Return health status
+///
+/// # Arguments
+///
+/// * `session` - SSH session to check
+///
+/// # Returns
+///
+/// * `true` - Session is healthy and functional
+/// * `false` - Session has issues and may need healing
 async fn is_session_healthy(session: &AsyncSession<AsyncTcpStream>) -> bool {
     // Try to create a simple channel to test if the session is still working
     match session.channel_session().await {
@@ -612,6 +926,38 @@ async fn is_session_healthy(session: &AsyncSession<AsyncTcpStream>) -> bool {
     }
 }
 
+/// Connects an inbound TCP stream to a remote service through SSH tunneling.
+///
+/// This function handles the core tunneling logic for individual connections.
+/// It manages session health, implements automatic healing on failures,
+/// and tracks connection failures to trigger proactive session maintenance.
+///
+/// # Connection Modes
+///
+/// The function supports multiple connection modes based on the parameters:
+/// - **Direct tunneling**: Connect to a specific remote address through SSH
+/// - **Command execution**: Execute a command and tunnel through stdin/stdout
+/// - **Command + Address**: Execute a command then connect to the specified address
+///
+/// # Failure Handling
+///
+/// - Tracks consecutive connection failures
+/// - Triggers immediate session healing after 2+ failures
+/// - Resets failure counter on successful connections
+/// - Distinguishes between healable and non-healable errors
+///
+/// # Arguments
+///
+/// * `config` - Tunnel configuration including shared session and credentials
+/// * `inbound` - Local TCP connection from client
+/// * `remote_addr` - Optional target service address
+/// * `cmd` - Optional command to execute on remote host
+/// * `cancel_rx` - Cancellation receiver for graceful shutdown
+///
+/// # Returns
+///
+/// * `Ok(())` - Connection established and completed successfully
+/// * `Err(Box<dyn Error>)` - Connection failed
 async fn connect_to_tunnel(
     config: &TunnelConfig,
     inbound: AsyncTcpStream,
@@ -707,6 +1053,48 @@ async fn connect_to_tunnel(
     }
 }
 
+/// Inner tunnel connection logic that handles the actual SSH operations.
+///
+/// This function implements the core SSH tunneling logic for different scenarios:
+///
+/// # Tunneling Scenarios
+///
+/// 1. **No Jump Hosts**: Direct TCP connection to remote address
+/// 2. **Command + Remote Address**: Execute command, wait for service, then connect
+/// 3. **Command Only**: Execute command and tunnel through stdin/stdout
+/// 4. **Remote Address Only**: Connect to existing service through SSH
+///
+/// # Command Execution Flow
+///
+/// When a command is provided, the function:
+/// 1. Creates an SSH execution channel
+/// 2. Executes the specified command
+/// 3. Waits for the service to become available (with retry logic)
+/// 4. Establishes the tunnel connection
+///
+/// # Retry Logic
+///
+/// For command scenarios, implements exponential backoff when waiting
+/// for services to start (up to 10 attempts with increasing delays).
+///
+/// # Type Parameters
+///
+/// * `S` - SSH session stream type
+///
+/// # Arguments
+///
+/// * `ex` - Async executor for spawning tunnel tasks
+/// * `inbound` - Local client connection
+/// * `session` - Authenticated SSH session
+/// * `jump_hosts` - Jump host chain (empty for direct connections)
+/// * `remote_addr` - Target service address
+/// * `cmd` - Command to execute on remote host
+/// * `cancel_rx` - Cancellation receiver
+///
+/// # Returns
+///
+/// * `Ok(())` - Tunnel established successfully
+/// * `Err(Box<dyn Error>)` - Tunnel setup failed
 async fn connect_to_tunnel_inner<S>(
     ex: Arc<Executor<'_>>,
     inbound: AsyncTcpStream,
@@ -813,30 +1201,63 @@ where
     Ok(())
 }
 
-/// Runs an asynchronous TCP server that listens for incoming connections and forwards them
-/// through a chain of SSH jump hosts to a specified remote address.
+/// Runs the main TCP server that handles incoming connections and forwards them through SSH.
+///
+/// This is the core server function that orchestrates the entire tunneling process.
+/// It handles:
+///
+/// # Server Responsibilities
+///
+/// 1. **TCP Server Management**: Binds to local address and accepts connections
+/// 2. **SSH Session Management**: Establishes and maintains SSH connection chains
+/// 3. **Connection Handling**: Spawns individual tunnel tasks for each client
+/// 4. **Health Monitoring**: Runs background session health checks
+/// 5. **Failure Recovery**: Implements automatic session healing
+/// 6. **Resource Cleanup**: Properly shuts down on cancellation
+///
+/// # Session Health Monitoring
+///
+/// The server runs a background task that:
+/// - Performs health checks every 30 seconds
+/// - Triggers healing for unhealthy sessions
+/// - Manages failure counters and recovery attempts
+/// - Implements exponential backoff for healing attempts
+///
+/// # Connection Lifecycle
+///
+/// For each incoming connection:
+/// 1. Accept the TCP connection
+/// 2. Create tunnel configuration
+/// 3. Spawn async task for tunnel handling
+/// 4. Handle connection through SSH chain
+/// 5. Clean up resources when connection closes
+///
+/// # Graceful Shutdown
+///
+/// The server supports graceful shutdown through the cancellation receiver:
+/// - Stops accepting new connections
+/// - Cancels the health monitoring task
+/// - Cleans up SSH sessions
+/// - Waits for existing connections to complete
 ///
 /// # Arguments
 ///
-/// * `addr` - The local address to bind the server to (e.g., "127.0.0.1:8000").
-/// * `jump_hosts` - A vector of SSH jump host addresses (e.g., ["jump1.example.com:22", "jump2.example.com:22"]).
-/// * `remote_addr` - The final remote address to forward connections to (e.g., "remote.example.com:80").
-/// * `creds` - A map containing SSH credentials for each host.
-/// * `cancel_token` - A cancellation token used to gracefully shut down the server.
+/// * `config` - Complete server configuration including addresses and credentials
+/// * `cancel_rx` - Cancellation receiver for graceful shutdown
+/// * `pair` - Condition variable pair for startup synchronization
 ///
 /// # Returns
 ///
-/// This function returns a `Result` indicating success or failure. On success, it runs the server
-/// indefinitely until the cancellation token is triggered.
+/// * `Ok(())` - Server shut down gracefully
+/// * `Err(Box<dyn Error>)` - Server encountered a fatal error
 ///
 /// # Errors
 ///
 /// This function will return an error if:
-///
-/// * Binding to the specified local address fails.
-/// * Accepting incoming connections fails.
-/// * Establishing an SSH session to any of the jump hosts fails.
-/// * Forwarding data between the local connection and the SSH channel fails.
+/// - Local address binding fails
+/// - Initial SSH session establishment fails
+/// - Critical connection acceptance errors occur
+/// - Session cleanup fails during shutdown
 ///
 async fn run_server(
     config: ServerConfig,
@@ -999,12 +1420,33 @@ async fn run_server(
     Ok(())
 }
 
-/// Checks if the `sops` binary is available in the system's PATH and returns its path if found.
+/// Locates the SOPS binary in the system's PATH.
+///
+/// SOPS (Secrets OPerationS) is required for decrypting credential files.
+/// This function searches the system PATH for the sops executable,
+/// handling both Unix-style and Windows-style executable names.
+///
+/// # Search Strategy
+///
+/// 1. Retrieve the system PATH environment variable
+/// 2. Iterate through each directory in PATH
+/// 3. Check for 'sops' (Unix/Linux/macOS) or 'sops.exe' (Windows)
+/// 4. Return the first valid executable found
 ///
 /// # Returns
 ///
-/// * `Ok(String)` - The absolute path to the `sops` binary.
-/// * `Err(String)` - An error message indicating that `sops` was not found.
+/// * `Ok(String)` - Absolute path to the sops binary
+/// * `Err(String)` - Error message if sops is not found
+///
+/// # Platform Support
+///
+/// - **Unix/Linux/macOS**: Looks for 'sops'
+/// - **Windows**: Looks for 'sops.exe'
+///
+/// # Prerequisites
+///
+/// The sops binary must be installed and accessible in the system PATH.
+/// Installation instructions are available at: https://github.com/mozilla/sops
 fn find_sops_binary() -> Result<String, String> {
     // Retrieve the system's PATH environment variable
     if let Ok(paths) = std::env::var("PATH") {
@@ -1185,14 +1627,39 @@ pub fn bind(
 /// A map of credentials loaded from a YAML file.
 pub type YamlCreds = BTreeMap<String, Creds>;
 
-/// Credentials required for SSH authentication.
+/// SSH authentication credentials for a single host.
+///
+/// This structure contains all the authentication information needed
+/// to connect to an SSH server, including optional TOTP support for
+/// two-factor authentication scenarios.
+///
+/// # Security Notes
+///
+/// These credentials are loaded from SOPS-encrypted files and should
+/// never be stored in plaintext. The TOTP key, when present, should
+/// be a base32-encoded secret as provided by the 2FA system.
+///
+/// # TOTP Key Format
+///
+/// The TOTP key should be in base32 format without padding, as typically
+/// provided by authenticator applications or when setting up 2FA.
+///
+/// # Examples
+///
+/// ```yaml
+/// # In SOPS-encrypted credentials file:
+/// example.com:22:
+///   username: "myuser"
+///   password: "mypassword"
+///   totp_key: "JBSWY3DPEHPK3PXP"  # base32 encoded
+/// ```
 #[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 pub struct Creds {
-    /// SSH username.
+    /// SSH username for authentication
     pub username: String,
-    /// SSH password.
+    /// SSH password for authentication
     pub password: String,
-    /// Optional base32 TOTP key for two-factor authentication.
+    /// Optional base32-encoded TOTP secret key for 2FA
     pub totp_key: Option<String>,
 }
 
@@ -1200,23 +1667,53 @@ pub struct Creds {
 static BINDINGS: LazyLock<Mutex<HashMap<String, (Sender<()>, std::thread::JoinHandle<()>)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Unbinds a previously established binding for the given address.
+/// Gracefully shuts down a previously established SSH tunnel binding.
 ///
-/// This function cancels the running server associated with the provided address
-/// and waits for its thread to finish. If the address is not found in the bindings,
-/// a warning is logged.
+/// This function performs a clean shutdown of the server associated with
+/// the specified address. It signals cancellation to the server thread
+/// and waits for all resources to be properly cleaned up.
+///
+/// # Shutdown Process
+///
+/// 1. Look up the binding in the global bindings map
+/// 2. Send cancellation signal to the server thread
+/// 3. Close the cancellation channel to stop accepting new connections
+/// 4. Wait for the server thread to complete cleanup
+/// 5. Remove the binding from the global map
+///
+/// # Resource Cleanup
+///
+/// The shutdown process ensures that:
+/// - All active SSH sessions are properly disconnected
+/// - TCP listeners are closed
+/// - Background monitoring tasks are cancelled
+/// - Thread resources are reclaimed
 ///
 /// # Arguments
 ///
-/// * `addr` - The address of the binding to unbind.
+/// * `addr` - The local address of the binding to shut down
 ///
-/// # Example
+/// # Examples
 ///
-/// ```
-/// use sshbind::unbind;
+/// ```rust,no_run
+/// use sshbind::{bind, unbind};
 ///
+/// // Start a tunnel
+/// bind("127.0.0.1:8000",
+///      vec!["jump1:22".to_string()],
+///      Some("service:80".to_string()),
+///      "creds.yaml",
+///      None);
+///
+/// // Later, shut it down cleanly
 /// unbind("127.0.0.1:8000");
 /// ```
+///
+/// # Behavior
+///
+/// - If the address is not found in active bindings, logs a warning
+/// - Blocks until the server thread completes shutdown
+/// - Thread join failures are logged but do not panic
 pub fn unbind(addr: &str) {
     let mut binds = BINDINGS.lock().unwrap();
     if let Some((cancel_tx, handle)) = binds.remove(addr) {
