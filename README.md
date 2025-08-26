@@ -9,6 +9,11 @@ SSHBind is a Rust library that enables developers to programmatically bind servi
 located behind multiple SSH connections to a local socket. This facilitates secure and
 seamless access to remote services, even those that are otherwise unreachable.
 
+## Platform Support
+
+- **Library**: Supports macOS, Linux, and Windows
+- **CLI Application**: Currently supported on Linux and Windows only
+
 ## Features
 
 - **Multiple Jump Host Support**: Navigate through a series of SSH jump hosts to reach
