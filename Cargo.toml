@@ -1,6 +1,6 @@
 [package]
 name = "sshbind"
-version = "0.0.3"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["Maximilian Philipp <maxkon2000@gmail.com>"]
@@ -58,4 +58,4 @@ serial_test = "3.2.0"
 
 # Platform-specific dependencies for binary (excluded on macOS)
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-named-sem = "0.2.3"
+named-sem = "0.2ff"
