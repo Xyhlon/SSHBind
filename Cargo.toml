@@ -49,7 +49,7 @@ secrecy = "0.10.3"
 age = "0.11.1"
 tempfile = "3.17.1"
 tokio = { version = "1", features = ["full"] }
-russh = "0.51.1"
+russh = "0.54.1"
 async-trait = "0.1.86"
 log = "0.4.26"
 env_logger = "0.11.6"
