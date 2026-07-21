@@ -628,6 +628,22 @@ struct TunnelPermit {
     sender: Sender<()>,
 }
 
+impl TunnelPermit {
+    fn try_acquire(
+        receiver: &Receiver<()>,
+        sender: &Sender<()>,
+    ) -> Result<Option<Self>, async_channel::TryRecvError> {
+        match receiver.try_recv() {
+            Ok(token) => Ok(Some(Self {
+                token: Some(token),
+                sender: sender.clone(),
+            })),
+            Err(async_channel::TryRecvError::Empty) => Ok(None),
+            Err(error @ async_channel::TryRecvError::Closed) => Err(error),
+        }
+    }
+}
+
 struct TunnelContext {
     cancel_rx: Receiver<()>,
     permit: TunnelPermit,
@@ -654,8 +670,6 @@ struct TunnelConfig {
     creds: YamlCreds,
     failure_counter: FailureCounter,
     tunnel_cancel_tx: Sender<()>,
-    tunnel_slot_tx: Sender<()>,
-    tunnel_slot_rx: Receiver<()>,
 }
 
 /// Configuration for the main TCP server.
@@ -1428,6 +1442,24 @@ async fn run_server(
                     }
                 };
 
+                let permit = match TunnelPermit::try_acquire(&tunnel_slot_rx, &tunnel_slot_tx) {
+                    Ok(Some(permit)) => permit,
+                    Ok(None) => {
+                        warn!(
+                            "Tunnel concurrency limit ({MAX_CONCURRENT_TUNNELS}) reached; rejecting connection"
+                        );
+                        drop(sock);
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("Tunnel concurrency limiter closed: {e}");
+                        return Err(std::io::Error::other(
+                            "tunnel concurrency limiter closed unexpectedly",
+                        )
+                        .into());
+                    }
+                };
+
                 // Handle each connection in a separate task
                 let tunnel_config = TunnelConfig {
                     ex: config.ex.clone(),
@@ -1436,25 +1468,12 @@ async fn run_server(
                     creds: config.creds.clone(),
                     failure_counter: failure_counter.clone(),
                     tunnel_cancel_tx: tunnel_cancel_tx.clone(),
-                    tunnel_slot_tx: tunnel_slot_tx.clone(),
-                    tunnel_slot_rx: tunnel_slot_rx.clone(),
                 };
                 let remote_addr_clone = remote_addr.cloned();
                 let cmd_clone = config.cmd.clone();
                 let tunnel_rx = tunnel_cancel_rx.clone();
 
                 config.ex.spawn(async move {
-                    match tunnel_config.tunnel_slot_rx.recv().await {
-                        Ok(()) => {}
-                        Err(e) => {
-                            error!("Tunnel concurrency limiter closed: {e}");
-                            return;
-                        }
-                    }
-                    let permit = TunnelPermit {
-                        token: Some(()),
-                        sender: tunnel_config.tunnel_slot_tx.clone(),
-                    };
                     match connect_to_tunnel(
                         &tunnel_config,
                         sock,
@@ -1787,5 +1806,29 @@ pub fn unbind(addr: &str) {
         }
     } else {
         warn!("No binding found for {}", addr);
+    }
+}
+
+#[cfg(test)]
+mod tunnel_permit_tests {
+    use super::*;
+
+    #[test]
+    fn permit_is_returned_when_connection_finishes() {
+        let (sender, receiver) = async_channel::bounded(1);
+        sender.try_send(()).unwrap();
+
+        let permit = TunnelPermit::try_acquire(&receiver, &sender)
+            .unwrap()
+            .expect("initial tunnel slot should be available");
+        assert!(TunnelPermit::try_acquire(&receiver, &sender)
+            .unwrap()
+            .is_none());
+
+        drop(permit);
+
+        assert!(TunnelPermit::try_acquire(&receiver, &sender)
+            .unwrap()
+            .is_some());
     }
 }

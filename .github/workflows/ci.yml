@@ -56,7 +56,15 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest]
-        check: [sshbind-audit, sshbind-deny, sshbind-doc, pre-commit-check]
+        check:
+          [
+            sshbind-audit,
+            sshbind-deny,
+            sshbind-doc,
+            sshbind-nextest,
+            sshbind-toml-fmt,
+            pre-commit-check,
+          ]
       fail-fast: false
     steps:
       - name: Checkout repository
