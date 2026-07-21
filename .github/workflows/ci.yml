@@ -116,7 +116,7 @@ jobs:
           # The binary should already be cached from the build job
           nix build .#checks.$SYSTEM.${{ matrix.test }} -L --show-trace
 
-  # Overall flake check (runs everything but benefits from cached builds)
+  # Overall flake evaluation; the jobs above build every check independently.
   flake-check:
     name: "Flake Check"
     runs-on: ${{ matrix.os }}
@@ -137,6 +137,5 @@ jobs:
       - name: Setup Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
-      # This should be very fast since everything is already cached
-      - name: Run flake check (should use cached builds)
-        run: nix flake check -L --show-trace
+      - name: Evaluate all flake checks
+        run: nix flake check --no-build -L --show-trace
