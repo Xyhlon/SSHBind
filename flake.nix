@@ -2,8 +2,8 @@
   description = "";
 
   inputs = {
-    # nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+    nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
     crane.url = "github:ipetkov/crane";
 
@@ -71,8 +71,9 @@
           ];
 
         nativeBuildInputs = with pkgs; [sops libiconv pkg-config];
-        # Additional environment variables can be set directly
-        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [pkgs.openssl];
+
+        # Needed by host build scripts (for example ssh2-config via git2).
+        LD_LIBRARY_PATH = lib.makeLibraryPath [pkgs.openssl];
       };
 
       # craneLibLlvmTools =
@@ -217,9 +218,13 @@
         # Inherit inputs from checks.
         checks = self.checks.${system};
 
-        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [pkgs.openssl];
         # Additional dev-shell environment variables can be set directly
         # MY_CUSTOM_DEVELOPMENT_VAR = "something else";
+
+        # Keep OpenSSL available to Cargo build scripts without poisoning nix itself.
+        RUSTFLAGS =
+          lib.optionalString pkgs.stdenv.isLinux
+          "-C link-arg=-Wl,-rpath,${lib.makeLibraryPath [pkgs.openssl]}";
 
         # Extra inputs can be added here; cargo and rustc are provided by default.
         packages = [
@@ -227,6 +232,8 @@
           pkgs.openssl
           pkgs.sops
           pkgs.age
+          pkgs.gh
+          pkgs.act
           pkgs.statix
           pkgs.gdb
           pkgs.ltex-ls
