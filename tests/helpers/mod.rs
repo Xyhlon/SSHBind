@@ -1,6 +1,4 @@
-use age::x25519;
 use libreauth::oath::TOTPBuilder;
-use secrecy::ExposeSecret;
 use sshbind::YamlCreds;
 use std::fs;
 use std::net::SocketAddr;
@@ -129,20 +127,20 @@ pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
     info!("Temp dir: {:?}", tmp_dir.path());
     let file_path = tmp_dir.path().join("secrets.yaml");
 
-    // Generate a new age key pair.
-    let identity = x25519::Identity::generate();
-    let public_key = identity.to_public();
-
     // Define file paths within the temporary directory.
     let key_path: PathBuf = tmp_dir.path().join("age_key.txt");
     let config_path: PathBuf = tmp_dir.path().join(".sops.yaml");
 
-    // Write the private key to our temporary file.
-    fs::write(&key_path, identity.to_string().expose_secret()).expect("Failed to write key");
+    // A fixed test-only identity keeps key generation out of the Rust
+    // dependency graph and makes the fixture deterministic.
+    const AGE_IDENTITY: &str =
+        "AGE-SECRET-KEY-1D8JAD8SXNFVQEFHAUNNAX4QCE3K5CUKMT7YYHNGTUSSP97YGWL4STV89UH";
+    const AGE_RECIPIENT: &str = "age1uc8zlurjyjpenrslc2thyl28u7ylz6x8c2g9yphvjha6xm8ppf3slq0l25";
+    fs::write(&key_path, AGE_IDENTITY).expect("Failed to write key");
 
     // Create a minimal SOPS configuration file.
     // Here we specify that for any YAML file, sops should use the given age public key.
-    let config_content = format!("keys:\n  - &master {}\ncreation_rules:\n  - path_regex: secrets.yaml$\n    key_groups:\n    - age:\n      - *master", public_key);
+    let config_content = format!("keys:\n  - &master {}\ncreation_rules:\n  - path_regex: secrets.yaml$\n    key_groups:\n    - age:\n      - *master", AGE_RECIPIENT);
 
     fs::write(&config_path, config_content).expect("Failed to write config");
 
