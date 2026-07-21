@@ -93,6 +93,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 type AsyncTcpStream = Async<TcpStream>;
 type AsyncTcpListener = Async<StdTcpListener>;
+const MAX_CONCURRENT_TUNNELS: usize = 32;
 
 /// Represents a host and port combination for SSH connections.
 ///
@@ -494,6 +495,7 @@ async fn userauth(
 /// * `a` - First stream (typically the local connection)
 /// * `b` - Second stream (typically the SSH channel)
 /// * `_cancel_rx` - Cancellation receiver (currently unused, reserved for future use)
+/// * `permit` - Optional concurrency permit held until the bridge exits
 ///
 /// # Returns
 ///
@@ -512,12 +514,14 @@ fn connect_chain_tunnel<A, B>(
     mut a: A,
     mut b: B,
     _cancel_rx: Receiver<()>,
+    permit: Option<TunnelPermit>,
 ) -> Task<std::io::Result<()>>
 where
     A: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
     B: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
     ex.spawn(async move {
+        let permit_guard = permit;
         info!("Bridge task starting");
 
         let mut buf_a = vec![0; 16 * 1024];
@@ -568,6 +572,7 @@ where
             }
         }
 
+        drop(permit_guard);
         Ok(())
     })
 }
@@ -618,6 +623,24 @@ where
 type SharedSession = Arc<Mutex<Option<AsyncSession<AsyncTcpStream>>>>;
 type FailureCounter = Arc<Mutex<u32>>;
 
+struct TunnelPermit {
+    token: Option<()>,
+    sender: Sender<()>,
+}
+
+struct TunnelContext {
+    cancel_rx: Receiver<()>,
+    permit: TunnelPermit,
+}
+
+impl Drop for TunnelPermit {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let _ = self.sender.try_send(token);
+        }
+    }
+}
+
 /// Configuration for individual tunnel connections.
 ///
 /// This structure contains all the necessary components for establishing
@@ -631,6 +654,8 @@ struct TunnelConfig {
     creds: YamlCreds,
     failure_counter: FailureCounter,
     tunnel_cancel_tx: Sender<()>,
+    tunnel_slot_tx: Sender<()>,
+    tunnel_slot_rx: Receiver<()>,
 }
 
 /// Configuration for the main TCP server.
@@ -839,7 +864,7 @@ async fn connect_chain(
 
         // Use the chain tunnel version to keep the connection alive
         let (_bridge_tx, bridge_rx) = async_channel::unbounded();
-        connect_chain_tunnel(ex.clone(), server_conn, channel, bridge_rx).detach();
+        connect_chain_tunnel(ex.clone(), server_conn, channel, bridge_rx, None).detach();
 
         // Give the bridge task a moment to start
         Timer::after(Duration::from_millis(100)).await;
@@ -968,6 +993,7 @@ async fn connect_to_tunnel(
     remote_addr: Option<&HostPort>,
     cmd: Option<&str>,
     cancel_rx: Receiver<()>,
+    permit: TunnelPermit,
 ) -> Result<(), Box<dyn Error>> {
     let session = {
         let session_guard = config.shared_session.lock().unwrap();
@@ -988,7 +1014,7 @@ async fn connect_to_tunnel(
             &config.jump_hosts,
             remote_addr,
             cmd,
-            cancel_rx,
+            TunnelContext { cancel_rx, permit },
         )
         .await
         {
@@ -1106,11 +1132,12 @@ async fn connect_to_tunnel_inner<S>(
     jump_hosts: &[HostPort],
     remote_addr: Option<&HostPort>,
     cmd: Option<&str>,
-    cancel_rx: Receiver<()>,
+    context: TunnelContext,
 ) -> Result<(), Box<dyn Error>>
 where
     S: AsyncSessionStream + Send + Sync + 'static,
 {
+    let TunnelContext { cancel_rx, permit } = context;
     if jump_hosts.is_empty() {
         let socket = remote_addr
             .expect("Remote address is required when no jump hosts are provided")
@@ -1120,7 +1147,7 @@ where
             .expect("Failed to resolve remote address");
         let outbound = AsyncTcpStream::connect(socket).await?;
 
-        connect_chain_tunnel(ex, inbound, outbound, cancel_rx).detach();
+        connect_chain_tunnel(ex, inbound, outbound, cancel_rx, Some(permit)).detach();
         // tokio::spawn(async move {
         //     let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
         // });
@@ -1148,7 +1175,14 @@ where
                         Ok(channel) => {
                             info!("SSH channel established ");
                             info!("Connected to remote address: {}", remote_addr);
-                            connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
+                            connect_chain_tunnel(
+                                ex.clone(),
+                                inbound,
+                                channel,
+                                cancel_rx,
+                                Some(permit),
+                            )
+                            .detach();
                             break;
                         }
                         Err(err) => {
@@ -1178,7 +1212,8 @@ where
                 // if exit_code != 0 {
                 //     error!("Command execution failed with exit code: {}", exit_code);
                 // }
-                connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
+                connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx, Some(permit))
+                    .detach();
             }
             (None, Some(remote_addr)) => {
                 // It is assumed that after the jumping through the
@@ -1191,7 +1226,8 @@ where
                     Ok(channel) => {
                         info!("SSH channel established ");
                         info!("Connected to remote address: {}", remote_addr);
-                        connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
+                        connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx, Some(permit))
+                            .detach();
                     }
                     Err(err) => return Err(err.into()),
                 }
@@ -1288,6 +1324,12 @@ async fn run_server(
     .await?;
     let shared_session: SharedSession = Arc::new(Mutex::new(Some(initial_session)));
     let failure_counter: FailureCounter = Arc::new(Mutex::new(0));
+    let (tunnel_slot_tx, tunnel_slot_rx) = async_channel::bounded(MAX_CONCURRENT_TUNNELS);
+    for _ in 0..MAX_CONCURRENT_TUNNELS {
+        tunnel_slot_tx
+            .try_send(())
+            .expect("tunnel slot channel must have capacity");
+    }
     info!("SSH session established");
 
     // Start session health monitor
@@ -1394,18 +1436,32 @@ async fn run_server(
                     creds: config.creds.clone(),
                     failure_counter: failure_counter.clone(),
                     tunnel_cancel_tx: tunnel_cancel_tx.clone(),
+                    tunnel_slot_tx: tunnel_slot_tx.clone(),
+                    tunnel_slot_rx: tunnel_slot_rx.clone(),
                 };
                 let remote_addr_clone = remote_addr.cloned();
                 let cmd_clone = config.cmd.clone();
                 let tunnel_rx = tunnel_cancel_rx.clone();
 
                 config.ex.spawn(async move {
+                    match tunnel_config.tunnel_slot_rx.recv().await {
+                        Ok(()) => {}
+                        Err(e) => {
+                            error!("Tunnel concurrency limiter closed: {e}");
+                            return;
+                        }
+                    }
+                    let permit = TunnelPermit {
+                        token: Some(()),
+                        sender: tunnel_config.tunnel_slot_tx.clone(),
+                    };
                     match connect_to_tunnel(
                         &tunnel_config,
                         sock,
                         remote_addr_clone.as_ref(),
                         cmd_clone.as_deref(),
                         tunnel_rx,
+                        permit,
                     ).await {
                         Ok(_) => {
                             info!("Connection handled successfully");
