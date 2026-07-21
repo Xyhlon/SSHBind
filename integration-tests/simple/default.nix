@@ -237,12 +237,14 @@
     )
     baseNodes;
 in
-  pkgs.nixosTest {
+  pkgs.testers.nixosTest {
     name = "Gateway Machine Target Testing Env";
     inherit nodes;
 
     testScript = ''
       import json
+      from test_driver.machine import BaseMachine
+
       start_all()
 
       for m in machines:
@@ -257,7 +259,7 @@ in
       for m in machines:
           m.wait_for_unit("network-online.target")
 
-      _vlans: dict[Machine, list[str]] = {}
+      _vlans: dict[BaseMachine, list[str]] = {}
       for m in machines:
           ifs = json.loads(m.succeed("ip -j addr"))
           lans = []
@@ -279,7 +281,7 @@ in
       #         else:
       #             m.fail(f"ping -c 2 host-{other.name}")
 
-      def setup_sops(m: Machine, user: str):
+      def setup_sops(m: BaseMachine, user: str):
           out = m.succeed(f"su -l {user} -c 'age-keygen -o age.key 2>&1'")
           age_pk = out.split("key: ")[1].strip()
 

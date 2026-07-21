@@ -150,7 +150,7 @@ pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
     assert!(key_path.exists());
     assert!(config_path.exists());
 
-    let stringified = serde_yml::to_string(&testcreds).expect("Failed to serialize");
+    let stringified = serde_yaml_ng::to_string(&testcreds).expect("Failed to serialize");
     //
     // Write test configuration to the file
     fs::write(&file_path, stringified).expect("Failed to write to file");
@@ -175,8 +175,8 @@ pub fn setup_sopsfile(testcreds: YamlCreds) -> TempDir {
 use async_trait::async_trait;
 use log::{error, info};
 use russh::keys::PublicKey;
-use russh::server::{Auth, Handler, Response, Server, Session};
-use russh::Channel;
+use russh::server::{Auth, ChannelOpenHandle, Handler, Response, Server, Session};
+use russh::{Channel, ChannelOpenFailure};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use tokio::net::TcpStream;
@@ -352,7 +352,8 @@ impl Handler for SSHServer {
                 } else {
                     info!("Else");
                     let responses: Vec<String> = response
-                        .unwrap()
+                        .into_iter()
+                        .flatten()
                         .filter_map(|b| String::from_utf8(b.to_vec()).ok())
                         .collect();
                     info!("2FA response: {:?}", responses);
@@ -402,7 +403,8 @@ impl Handler for SSHServer {
                 });
             } else {
                 let responses: Vec<String> = response
-                    .unwrap()
+                    .into_iter()
+                    .flatten()
                     .filter_map(|b| String::from_utf8(b.to_vec()).ok())
                     .collect();
                 info!("2FA response: {:?}", responses);
@@ -454,11 +456,13 @@ impl Handler for SSHServer {
     fn channel_open_session(
         &mut self,
         channel: Channel<russh::server::Msg>,
-        session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
             info!("Session channel opened: {:?}", channel);
-            Ok(true)
+            reply.accept().await;
+            Ok(())
         }
     }
 
@@ -470,8 +474,9 @@ impl Handler for SSHServer {
         port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
-        session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        reply: ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         async move {
             info!(
                 "Direct TCP/IP channel request to {}:{}",
@@ -482,13 +487,16 @@ impl Handler for SSHServer {
                     "Rejected direct TCP/IP channel: target {} not allowed",
                     host_to_connect
                 );
-                return Ok(false);
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+                return Ok(());
             }
             let port: u16 = port_to_connect as u16;
             match TcpStream::connect((host_to_connect, port)).await {
                 Ok(mut target_stream) => {
                     // Signal that the channel connection was successful.
-                    session.channel_success(channel.id())?;
+                    reply.accept().await;
                     info!("Channel confirmed");
                     // use russh::channels::channel_stream::ChannelStream;
                     // let mut chan_stream = ChannelStream::new(channel);
@@ -503,14 +511,15 @@ impl Handler for SSHServer {
                             error!("Forwarding error: {}", e);
                         }
                     });
-                    Ok(true)
+                    Ok(())
                 }
                 Err(e) => {
                     error!(
                         "Failed to connect to target {}:{} - {}",
                         host_to_connect, port, e
                     );
-                    Ok(false)
+                    reply.reject(ChannelOpenFailure::ConnectFailed).await;
+                    Ok(())
                 }
             }
         }

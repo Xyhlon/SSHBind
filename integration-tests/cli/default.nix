@@ -75,11 +75,13 @@
     };
   };
 in
-  pkgs.nixosTest {
+  pkgs.testers.nixosTest {
     name = "Testing CLI usage";
     inherit nodes;
 
     testScript = ''
+      from test_driver.machine import BaseMachine
+
       start_all()
 
       for m in machines:
@@ -88,7 +90,7 @@ in
       for m in machines:
           m.wait_for_unit("network.target")
 
-      def setup_sops(m: Machine, user: str):
+      def setup_sops(m: BaseMachine, user: str):
           out = m.succeed(f"su -l {user} -c 'age-keygen -o age.key 2>&1'")
           age_pk = out.split("key: ")[1].strip()
 

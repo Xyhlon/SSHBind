@@ -72,9 +72,7 @@ async fn test_correct_configuration() -> Result<(), Box<dyn std::error::Error>> 
     let tmp_dir = helpers::setup_sopsfile(testcreds.clone());
     let sopsfile_path = tmp_dir.path().join("secrets.yaml");
     let mut config = russh::server::Config::default();
-    // Use OsRng from rand for randomness.
-    use russh::keys::ssh_key::rand_core::OsRng;
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
 
     #[cfg(unix)]
     {
@@ -202,9 +200,7 @@ async fn test_correct_configuration_multiple() -> Result<(), Box<dyn std::error:
     let tmp_dir = helpers::setup_sopsfile(testcreds.clone());
     let sopsfile_path = tmp_dir.path().join("secrets.yaml");
     let mut config = russh::server::Config::default();
-    // Use OsRng from rand for randomness.
-    use russh::keys::ssh_key::rand_core::OsRng;
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
 
     #[cfg(unix)]
     {
@@ -337,9 +333,7 @@ async fn test_second_server_wrong_credentials() -> Result<(), Box<dyn std::error
     let tmp_dir = helpers::setup_sopsfile(testcreds.clone());
     let sopsfile_path = tmp_dir.path().join("secrets.yaml");
     let mut config = russh::server::Config::default();
-    // Use OsRng from rand for randomness.
-    use russh::keys::ssh_key::rand_core::OsRng;
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
 
     #[cfg(unix)]
     {
@@ -467,9 +461,7 @@ async fn test_correct_configuration_2fa() -> Result<(), Box<dyn std::error::Erro
     let tmp_dir = helpers::setup_sopsfile(testcreds.clone());
     let sopsfile_path = tmp_dir.path().join("secrets.yaml");
     let mut config = russh::server::Config::default();
-    // Use OsRng from rand for randomness.
-    use russh::keys::ssh_key::rand_core::OsRng;
-    let mut rng = OsRng;
+    let mut rng = rand::rng();
 
     #[cfg(unix)]
     {

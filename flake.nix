@@ -74,6 +74,11 @@
 
         # Needed by host build scripts (for example ssh2-config via git2).
         LD_LIBRARY_PATH = lib.makeLibraryPath [pkgs.openssl];
+
+        # Keep OpenSSL in the runtime closure of the packaged binary.
+        RUSTFLAGS =
+          lib.optionalString pkgs.stdenv.isLinux
+          "-C link-arg=-Wl,-rpath,${lib.makeLibraryPath [pkgs.openssl]}";
       };
 
       # craneLibLlvmTools =

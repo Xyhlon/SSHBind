@@ -1574,7 +1574,7 @@ pub fn bind(
             panic!("Invalid remote address, doesn't conform to URI format of RFC 3986 / RFC 7230 / RFC 9110");
         });
 
-    let creds: YamlCreds = match serde_yml::from_str(&String::from_utf8_lossy(&output.stdout)) {
+    let creds: YamlCreds = match serde_yaml_ng::from_str(&String::from_utf8_lossy(&output.stdout)) {
         Ok(creds) => creds,
         Err(e) => {
             error!("Failed to deserialize credentials: {e}");
