@@ -180,6 +180,23 @@ pub struct TotpPromptHandler {
     creds: Creds,
 }
 
+impl TotpPromptHandler {
+    fn totp_response(&self) -> String {
+        let Some(totp_key) = self.creds.totp_key.as_ref() else {
+            warn!("Keyboard-interactive authentication requested TOTP without a configured key");
+            return String::new();
+        };
+
+        match TOTPBuilder::new().base32_key(totp_key).finalize() {
+            Ok(totp) => totp.generate(),
+            Err(e) => {
+                error!("Configured TOTP key is invalid: {e}");
+                String::new()
+            }
+        }
+    }
+}
+
 impl KeyboardInteractivePrompt for TotpPromptHandler {
     fn prompt(
         &mut self,
@@ -204,11 +221,7 @@ impl KeyboardInteractivePrompt for TotpPromptHandler {
                     || s.contains("code")
                     || s.contains("token")) =>
                 {
-                    TOTPBuilder::new()
-                        .base32_key(&self.creds.totp_key.clone().expect("TOTP key is required"))
-                        .finalize()
-                        .expect("Failed to build totp builder")
-                        .generate()
+                    self.totp_response()
                 }
                 s if s.contains("pass") => self.creds.password.clone(),
                 _ => "".into(),
@@ -330,7 +343,7 @@ impl OrderedAuthMethods {
 /// - No credentials are found for the specified host
 /// - All authentication methods fail
 /// - Network errors occur during authentication
-/// - TOTP key is required but not provided
+/// - A required TOTP response cannot be generated from the configured credentials
 ///
 /// # Examples
 ///
@@ -1810,7 +1823,7 @@ pub fn unbind(addr: &str) {
 }
 
 #[cfg(test)]
-mod tunnel_permit_tests {
+mod unit_tests {
     use super::*;
 
     #[test]
@@ -1830,5 +1843,35 @@ mod tunnel_permit_tests {
         assert!(TunnelPermit::try_acquire(&receiver, &sender)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn missing_totp_key_rejects_prompt_without_panicking() {
+        let mut handler = TotpPromptHandler {
+            creds: Creds {
+                username: "alice".to_string(),
+                password: "password".to_string(),
+                totp_key: None,
+            },
+        };
+        let prompts = [Prompt {
+            text: "Enter 2FA code: ".into(),
+            echo: false,
+        }];
+
+        assert_eq!(handler.prompt("alice", "", &prompts), vec![String::new()]);
+    }
+
+    #[test]
+    fn malformed_totp_key_rejects_prompt_without_panicking() {
+        let handler = TotpPromptHandler {
+            creds: Creds {
+                username: "alice".to_string(),
+                password: "password".to_string(),
+                totp_key: Some("not-valid-base32!".to_string()),
+            },
+        };
+
+        assert_eq!(handler.totp_response(), String::new());
     }
 }
