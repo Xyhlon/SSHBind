@@ -807,7 +807,11 @@ async fn connect_chain(
     creds_map: &YamlCreds,
     _cancel_tx: Sender<()>,
 ) -> Result<AsyncSession<AsyncTcpStream>, Box<dyn Error>> {
-    assert!(!jump_hosts.is_empty(), "No jump hosts provided");
+    // SSHBind requires at least one jump host for SSH tunneling
+    if jump_hosts.is_empty() {
+        return Err("SSHBind requires at least one SSH jump host. Direct TCP connections are not supported.".into());
+    }
+
     info!("Starting SSH chain connection through {:?}", jump_hosts);
 
     let stream = AsyncTcpStream::connect(jump_hosts[0].clone()).await?;
