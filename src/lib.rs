@@ -93,6 +93,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 type AsyncTcpStream = Async<TcpStream>;
 type AsyncTcpListener = Async<StdTcpListener>;
+const MAX_CONCURRENT_TUNNELS: usize = 32;
 
 /// Represents a host and port combination for SSH connections.
 ///
@@ -179,6 +180,23 @@ pub struct TotpPromptHandler {
     creds: Creds,
 }
 
+impl TotpPromptHandler {
+    fn totp_response(&self) -> String {
+        let Some(totp_key) = self.creds.totp_key.as_ref() else {
+            warn!("Keyboard-interactive authentication requested TOTP without a configured key");
+            return String::new();
+        };
+
+        match TOTPBuilder::new().base32_key(totp_key).finalize() {
+            Ok(totp) => totp.generate(),
+            Err(e) => {
+                error!("Configured TOTP key is invalid: {e}");
+                String::new()
+            }
+        }
+    }
+}
+
 impl KeyboardInteractivePrompt for TotpPromptHandler {
     fn prompt(
         &mut self,
@@ -203,11 +221,7 @@ impl KeyboardInteractivePrompt for TotpPromptHandler {
                     || s.contains("code")
                     || s.contains("token")) =>
                 {
-                    TOTPBuilder::new()
-                        .base32_key(&self.creds.totp_key.clone().expect("TOTP key is required"))
-                        .finalize()
-                        .expect("Failed to build totp builder")
-                        .generate()
+                    self.totp_response()
                 }
                 s if s.contains("pass") => self.creds.password.clone(),
                 _ => "".into(),
@@ -329,7 +343,7 @@ impl OrderedAuthMethods {
 /// - No credentials are found for the specified host
 /// - All authentication methods fail
 /// - Network errors occur during authentication
-/// - TOTP key is required but not provided
+/// - A required TOTP response cannot be generated from the configured credentials
 ///
 /// # Examples
 ///
@@ -494,6 +508,7 @@ async fn userauth(
 /// * `a` - First stream (typically the local connection)
 /// * `b` - Second stream (typically the SSH channel)
 /// * `_cancel_rx` - Cancellation receiver (currently unused, reserved for future use)
+/// * `permit` - Optional concurrency permit held until the bridge exits
 ///
 /// # Returns
 ///
@@ -512,12 +527,14 @@ fn connect_chain_tunnel<A, B>(
     mut a: A,
     mut b: B,
     _cancel_rx: Receiver<()>,
+    permit: Option<TunnelPermit>,
 ) -> Task<std::io::Result<()>>
 where
     A: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
     B: AsyncReadExt + AsyncWriteExt + Unpin + Send + 'static,
 {
     ex.spawn(async move {
+        let permit_guard = permit;
         info!("Bridge task starting");
 
         let mut buf_a = vec![0; 16 * 1024];
@@ -568,6 +585,7 @@ where
             }
         }
 
+        drop(permit_guard);
         Ok(())
     })
 }
@@ -617,6 +635,40 @@ where
 ///
 type SharedSession = Arc<Mutex<Option<AsyncSession<AsyncTcpStream>>>>;
 type FailureCounter = Arc<Mutex<u32>>;
+
+struct TunnelPermit {
+    token: Option<()>,
+    sender: Sender<()>,
+}
+
+impl TunnelPermit {
+    fn try_acquire(
+        receiver: &Receiver<()>,
+        sender: &Sender<()>,
+    ) -> Result<Option<Self>, async_channel::TryRecvError> {
+        match receiver.try_recv() {
+            Ok(token) => Ok(Some(Self {
+                token: Some(token),
+                sender: sender.clone(),
+            })),
+            Err(async_channel::TryRecvError::Empty) => Ok(None),
+            Err(error @ async_channel::TryRecvError::Closed) => Err(error),
+        }
+    }
+}
+
+struct TunnelContext {
+    cancel_rx: Receiver<()>,
+    permit: TunnelPermit,
+}
+
+impl Drop for TunnelPermit {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let _ = self.sender.try_send(token);
+        }
+    }
+}
 
 /// Configuration for individual tunnel connections.
 ///
@@ -807,7 +859,11 @@ async fn connect_chain(
     creds_map: &YamlCreds,
     _cancel_tx: Sender<()>,
 ) -> Result<AsyncSession<AsyncTcpStream>, Box<dyn Error>> {
-    assert!(!jump_hosts.is_empty(), "No jump hosts provided");
+    // SSHBind requires at least one jump host for SSH tunneling
+    if jump_hosts.is_empty() {
+        return Err("SSHBind requires at least one SSH jump host. Direct TCP connections are not supported.".into());
+    }
+
     info!("Starting SSH chain connection through {:?}", jump_hosts);
 
     let stream = AsyncTcpStream::connect(jump_hosts[0].clone()).await?;
@@ -835,7 +891,7 @@ async fn connect_chain(
 
         // Use the chain tunnel version to keep the connection alive
         let (_bridge_tx, bridge_rx) = async_channel::unbounded();
-        connect_chain_tunnel(ex.clone(), server_conn, channel, bridge_rx).detach();
+        connect_chain_tunnel(ex.clone(), server_conn, channel, bridge_rx, None).detach();
 
         // Give the bridge task a moment to start
         Timer::after(Duration::from_millis(100)).await;
@@ -964,6 +1020,7 @@ async fn connect_to_tunnel(
     remote_addr: Option<&HostPort>,
     cmd: Option<&str>,
     cancel_rx: Receiver<()>,
+    permit: TunnelPermit,
 ) -> Result<(), Box<dyn Error>> {
     let session = {
         let session_guard = config.shared_session.lock().unwrap();
@@ -984,7 +1041,7 @@ async fn connect_to_tunnel(
             &config.jump_hosts,
             remote_addr,
             cmd,
-            cancel_rx,
+            TunnelContext { cancel_rx, permit },
         )
         .await
         {
@@ -1102,11 +1159,12 @@ async fn connect_to_tunnel_inner<S>(
     jump_hosts: &[HostPort],
     remote_addr: Option<&HostPort>,
     cmd: Option<&str>,
-    cancel_rx: Receiver<()>,
+    context: TunnelContext,
 ) -> Result<(), Box<dyn Error>>
 where
     S: AsyncSessionStream + Send + Sync + 'static,
 {
+    let TunnelContext { cancel_rx, permit } = context;
     if jump_hosts.is_empty() {
         let socket = remote_addr
             .expect("Remote address is required when no jump hosts are provided")
@@ -1116,7 +1174,7 @@ where
             .expect("Failed to resolve remote address");
         let outbound = AsyncTcpStream::connect(socket).await?;
 
-        connect_chain_tunnel(ex, inbound, outbound, cancel_rx).detach();
+        connect_chain_tunnel(ex, inbound, outbound, cancel_rx, Some(permit)).detach();
         // tokio::spawn(async move {
         //     let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
         // });
@@ -1144,7 +1202,14 @@ where
                         Ok(channel) => {
                             info!("SSH channel established ");
                             info!("Connected to remote address: {}", remote_addr);
-                            connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
+                            connect_chain_tunnel(
+                                ex.clone(),
+                                inbound,
+                                channel,
+                                cancel_rx,
+                                Some(permit),
+                            )
+                            .detach();
                             break;
                         }
                         Err(err) => {
@@ -1174,7 +1239,8 @@ where
                 // if exit_code != 0 {
                 //     error!("Command execution failed with exit code: {}", exit_code);
                 // }
-                connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
+                connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx, Some(permit))
+                    .detach();
             }
             (None, Some(remote_addr)) => {
                 // It is assumed that after the jumping through the
@@ -1187,7 +1253,8 @@ where
                     Ok(channel) => {
                         info!("SSH channel established ");
                         info!("Connected to remote address: {}", remote_addr);
-                        connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx).detach();
+                        connect_chain_tunnel(ex.clone(), inbound, channel, cancel_rx, Some(permit))
+                            .detach();
                     }
                     Err(err) => return Err(err.into()),
                 }
@@ -1284,6 +1351,12 @@ async fn run_server(
     .await?;
     let shared_session: SharedSession = Arc::new(Mutex::new(Some(initial_session)));
     let failure_counter: FailureCounter = Arc::new(Mutex::new(0));
+    let (tunnel_slot_tx, tunnel_slot_rx) = async_channel::bounded(MAX_CONCURRENT_TUNNELS);
+    for _ in 0..MAX_CONCURRENT_TUNNELS {
+        tunnel_slot_tx
+            .try_send(())
+            .expect("tunnel slot channel must have capacity");
+    }
     info!("SSH session established");
 
     // Start session health monitor
@@ -1382,6 +1455,24 @@ async fn run_server(
                     }
                 };
 
+                let permit = match TunnelPermit::try_acquire(&tunnel_slot_rx, &tunnel_slot_tx) {
+                    Ok(Some(permit)) => permit,
+                    Ok(None) => {
+                        warn!(
+                            "Tunnel concurrency limit ({MAX_CONCURRENT_TUNNELS}) reached; rejecting connection"
+                        );
+                        drop(sock);
+                        continue;
+                    }
+                    Err(e) => {
+                        error!("Tunnel concurrency limiter closed: {e}");
+                        return Err(std::io::Error::other(
+                            "tunnel concurrency limiter closed unexpectedly",
+                        )
+                        .into());
+                    }
+                };
+
                 // Handle each connection in a separate task
                 let tunnel_config = TunnelConfig {
                     ex: config.ex.clone(),
@@ -1402,6 +1493,7 @@ async fn run_server(
                         remote_addr_clone.as_ref(),
                         cmd_clone.as_deref(),
                         tunnel_rx,
+                        permit,
                     ).await {
                         Ok(_) => {
                             info!("Connection handled successfully");
@@ -1570,7 +1662,7 @@ pub fn bind(
             panic!("Invalid remote address, doesn't conform to URI format of RFC 3986 / RFC 7230 / RFC 9110");
         });
 
-    let creds: YamlCreds = match serde_yml::from_str(&String::from_utf8_lossy(&output.stdout)) {
+    let creds: YamlCreds = match serde_yaml_ng::from_str(&String::from_utf8_lossy(&output.stdout)) {
         Ok(creds) => creds,
         Err(e) => {
             error!("Failed to deserialize credentials: {e}");
@@ -1727,5 +1819,59 @@ pub fn unbind(addr: &str) {
         }
     } else {
         warn!("No binding found for {}", addr);
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn permit_is_returned_when_connection_finishes() {
+        let (sender, receiver) = async_channel::bounded(1);
+        sender.try_send(()).unwrap();
+
+        let permit = TunnelPermit::try_acquire(&receiver, &sender)
+            .unwrap()
+            .expect("initial tunnel slot should be available");
+        assert!(TunnelPermit::try_acquire(&receiver, &sender)
+            .unwrap()
+            .is_none());
+
+        drop(permit);
+
+        assert!(TunnelPermit::try_acquire(&receiver, &sender)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn missing_totp_key_rejects_prompt_without_panicking() {
+        let mut handler = TotpPromptHandler {
+            creds: Creds {
+                username: "alice".to_string(),
+                password: "password".to_string(),
+                totp_key: None,
+            },
+        };
+        let prompts = [Prompt {
+            text: "Enter 2FA code: ".into(),
+            echo: false,
+        }];
+
+        assert_eq!(handler.prompt("alice", "", &prompts), vec![String::new()]);
+    }
+
+    #[test]
+    fn malformed_totp_key_rejects_prompt_without_panicking() {
+        let handler = TotpPromptHandler {
+            creds: Creds {
+                username: "alice".to_string(),
+                password: "password".to_string(),
+                totp_key: Some("not-valid-base32!".to_string()),
+            },
+        };
+
+        assert_eq!(handler.totp_response(), String::new());
     }
 }

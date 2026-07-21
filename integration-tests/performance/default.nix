@@ -90,11 +90,13 @@
     };
   };
 in
-  pkgs.nixosTest {
+  pkgs.testers.nixosTest {
     name = "Performance Throughput Stability Testing";
     inherit nodes;
 
     testScript = ''
+      from test_driver.machine import BaseMachine
+
       start_all()
 
       for m in machines:
@@ -103,7 +105,7 @@ in
       for m in machines:
           m.wait_for_unit("network.target")
 
-      def setup_sops(m: Machine, user: str):
+      def setup_sops(m: BaseMachine, user: str):
           out = m.succeed(f"su -l {user} -c 'age-keygen -o age.key 2>&1'")
           age_pk = out.split("key: ")[1].strip()
 
@@ -146,10 +148,9 @@ in
       print(user.succeed("sockperf pp -i 127.0.0.1 -p 8004 -m 350 -t 30 --tcp"))
       print(user.succeed("sockperf ul -i 127.0.0.1 -p 8004 -m 200 -t 30 --mps 100000 --tcp"))
       print(user.succeed("sockperf tp -i 127.0.0.1 -p 8004 -m 1400 -t 15 --tcp"))
-      print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8000"))
-      print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8001"))
-      print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8002"))
-      print(user.succeed(r"oha -c 200 -z 10s http://127.0.0.1:8003"))
+      for port in range(8000, 8004):
+          print(user.succeed(f"oha -c 200 -z 10s http://127.0.0.1:{port}"))
+          user.succeed("pgrep -u alice -x sshbind")
       # user.send_chars("btop\n")
       # print(user.succeed("cat /home/alice/.local/share/sshbind/sshbind_*"))
 
