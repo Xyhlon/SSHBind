@@ -40,7 +40,7 @@
           perf-tools
           tokio-console
         ]
-        ++ [pkgs.linuxPackages.perf];
+        ++ [pkgs.perf];
       boot.kernel.sysctl = {
         "kernel.perf_event_paranoid" = 1; # use 0 or -1 for broader access
         "kernel.kptr_restrict" = 0; # allows resolving kernel symbols
