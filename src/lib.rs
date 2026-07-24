@@ -65,6 +65,7 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::thread;
@@ -149,7 +150,11 @@ impl FromStr for HostPort {
 
 impl fmt::Display for HostPort {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)
+        if self.host.contains(':') {
+            write!(f, "[{}]:{}", self.host, self.port)
+        } else {
+            write!(f, "{}:{}", self.host, self.port)
+        }
     }
 }
 
@@ -317,6 +322,18 @@ impl OrderedAuthMethods {
     }
 }
 
+fn identity_file_from_config(path: &Path, host: &str) -> Result<Option<PathBuf>, String> {
+    let file = File::open(path).map_err(|error| format!("Failed to open SSH config: {error}"))?;
+    let mut reader = BufReader::new(file);
+    let config = SshConfig::default()
+        .parse(&mut reader, ParseRule::STRICT)
+        .map_err(|error| format!("Failed to parse SSH config: {error:?}"))?;
+    Ok(config
+        .query(host)
+        .identity_file
+        .and_then(|files| files.first().cloned()))
+}
+
 /// Authenticates a user for the given SSH session using multiple authentication methods.
 ///
 /// This function implements a robust authentication flow that:
@@ -389,56 +406,33 @@ async fn userauth(
             }
             AuthMethod::PublicKey => {
                 info!("Attempting public key authentication via ssh config.");
-
-                let host_params = {
-                    // Read and parse the SSH configuration from ~/.ssh/config.
-                    let home = dirs::home_dir().expect("No home directory found");
-                    let config_path = home.join(".ssh/config");
-                    // open file if exists else continue
-                    let config_path = if config_path.exists() {
+                let home = dirs::home_dir().expect("No home directory found");
+                let config_path = home.join(".ssh/config");
+                if !config_path.exists() {
+                    info!(
+                        "SSH config file not found at {:?}. Trying other Authentication Methods",
                         config_path
-                    } else {
-                        info!("SSH config file not found at {:?}. Trying other Authentication Methods", config_path);
-                        continue;
-                    };
-                    let file = File::open(&config_path)
-                        .map_err(|e| format!("Failed to open SSH config: {}", e))?;
-                    let mut reader = BufReader::new(file);
-                    // Parse the SSH config file. if fails continue
-                    let config = SshConfig::default().parse(&mut reader, ParseRule::STRICT);
-
-                    let config = match config {
-                        Ok(config) => config,
-                        Err(_) => {
-                            info!(
-                            "Failed to parse SSH config: {:?}. Trying other Authentication Methods",
-                            config_path
-                        );
-                            continue;
-                        }
-                    };
-
-                    // Query the config for this host.
-                    config.query(&host.host)
-                };
-
-                if let Some(identity_files) = host_params.identity_file {
-                    info!("Found IdentityFile in config: {:?}", identity_files);
-                    // Use the identity file for public key authentication.
-                    // (Adjust the API call if async_ssh2_lite has a different signature.)
-                    let identity_file = identity_files.first().expect("No identity files found");
-                    session
-                        .userauth_pubkey_file(
-                            &username,
-                            Some(identity_file),
-                            identity_file,
-                            None, // Optionally supply a passphrase here
-                        )
-                        .await
-                } else {
-                    warn!("No IdentityFile found in SSH config for host {}", host);
+                    );
                     continue;
                 }
+                let identity_file = match identity_file_from_config(&config_path, &host.host) {
+                    Ok(Some(identity_file)) => identity_file,
+                    Ok(None) => {
+                        warn!("No IdentityFile found in SSH config for host {}", host);
+                        continue;
+                    }
+                    Err(error) => {
+                        info!(
+                            "{error}. Trying other Authentication Methods: {:?}",
+                            config_path
+                        );
+                        continue;
+                    }
+                };
+                info!("Found IdentityFile in config: {:?}", identity_file);
+                session
+                    .userauth_pubkey_file(&username, Some(&identity_file), &identity_file, None)
+                    .await
             }
             _ => {
                 info!("Skipping unsupported method: {}", method);
@@ -1326,20 +1320,34 @@ where
 /// - Critical connection acceptance errors occur
 /// - Session cleanup fails during shutdown
 ///
+fn release_startup_waiter(pair: &Arc<(Mutex<bool>, Condvar)>) {
+    let (lock, cvar) = &**pair;
+    let mut pending = lock.lock().unwrap();
+    *pending = false;
+    cvar.notify_one();
+}
+
 async fn run_server(
     config: ServerConfig,
     cancel_rx: Receiver<()>,
     pair: Arc<(Mutex<bool>, Condvar)>,
 ) -> Result<(), Box<dyn Error>> {
-    let listener = AsyncTcpListener::bind(config.addr.parse::<SocketAddr>()?)?;
+    let bind_addr = match config.addr.parse::<SocketAddr>() {
+        Ok(bind_addr) => bind_addr,
+        Err(error) => {
+            release_startup_waiter(&pair);
+            return Err(error.into());
+        }
+    };
+    let listener = match AsyncTcpListener::bind(bind_addr) {
+        Ok(listener) => listener,
+        Err(error) => {
+            release_startup_waiter(&pair);
+            return Err(error.into());
+        }
+    };
     info!("Listening on {}", config.addr);
-    {
-        let (lock, cvar) = &*pair;
-        let mut pending = lock.lock().unwrap();
-        *pending = false;
-        // We notify the condvar that the value has changed.
-        cvar.notify_one();
-    }
+    release_startup_waiter(&pair);
     let remote_addr = config.remote_addr.as_ref();
     let (tunnel_cancel_tx, tunnel_cancel_rx) = async_channel::unbounded();
     let initial_session = connect_chain(
@@ -1539,25 +1547,62 @@ async fn run_server(
 ///
 /// The sops binary must be installed and accessible in the system PATH.
 /// Installation instructions are available at: https://github.com/mozilla/sops
-fn find_sops_binary() -> Result<String, String> {
-    // Retrieve the system's PATH environment variable
-    if let Ok(paths) = std::env::var("PATH") {
-        // Iterate over each path in the PATH variable
-        for path in std::env::split_paths(&paths) {
-            // Construct the full path to the `sops` executable
-            let sops_path = path.join("sops");
-            // On Windows, executables typically have a `.exe` extension
-            let sops_path_exe = path.join("sops.exe");
+fn find_sops_binary_in<I, P>(paths: I) -> Option<PathBuf>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<Path>,
+{
+    paths.into_iter().find_map(|path| {
+        let path = path.as_ref();
+        [path.join("sops"), path.join("sops.exe")]
+            .into_iter()
+            .find(|candidate| is_executable_file(candidate))
+    })
+}
 
-            // Check if the `sops` executable exists and is a file
-            if sops_path.is_file() {
-                return Ok(sops_path.to_string_lossy().to_string());
-            } else if sops_path_exe.is_file() {
-                return Ok(sops_path_exe.to_string_lossy().to_string());
-            }
-        }
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
     }
-    Err("`sops` binary not found in system's PATH.".to_string())
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn find_sops_binary() -> Result<String, String> {
+    let paths = std::env::var_os("PATH")
+        .ok_or_else(|| "`sops` binary not found in system's PATH.".to_string())?;
+    find_sops_binary_in(std::env::split_paths(&paths))
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or_else(|| "`sops` binary not found in system's PATH.".to_string())
+}
+
+fn parse_credentials(bytes: &[u8]) -> Result<YamlCreds, serde_yaml_ng::Error> {
+    serde_yaml_ng::from_slice(bytes)
+}
+
+fn decrypt_credentials(sops_binary: &Path, sopsfile: &Path) -> Result<YamlCreds, String> {
+    let output = Command::new(sops_binary)
+        .arg("decrypt")
+        .arg(sopsfile)
+        .output()
+        .map_err(|error| format!("Failed to execute sops command: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "SOPS decryption failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    parse_credentials(&output.stdout)
+        .map_err(|error| format!("Failed to deserialize credentials: {error}"))
 }
 
 #[allow(clippy::needless_doctest_main)]
@@ -1631,19 +1676,13 @@ pub fn bind(
         return;
     }
 
-    let output = Command::new(&sops_path)
-        .arg("decrypt")
-        .arg(sopsfile)
-        .output()
-        .expect("Failed to execute sops command");
-
-    if !output.status.success() {
-        error!(
-            "SOPS decryption failed: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+    let creds = match decrypt_credentials(Path::new(&sops_path), Path::new(sopsfile)) {
+        Ok(creds) => creds,
+        Err(error) => {
+            error!("{error}");
+            return;
+        }
+    };
 
     let jump_hosts: Vec<HostPort> = jump_hosts
         .iter()
@@ -1661,14 +1700,6 @@ pub fn bind(
             error!("Failed to parse remote address: {}", e);
             panic!("Invalid remote address, doesn't conform to URI format of RFC 3986 / RFC 7230 / RFC 9110");
         });
-
-    let creds: YamlCreds = match serde_yaml_ng::from_str(&String::from_utf8_lossy(&output.stdout)) {
-        Ok(creds) => creds,
-        Err(e) => {
-            error!("Failed to deserialize credentials: {e}");
-            return;
-        }
-    };
 
     let (cancel_tx, cancel_rx) = async_channel::unbounded();
     let bind_addr = addr.to_string();
@@ -1825,6 +1856,334 @@ pub fn unbind(addr: &str) {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    struct TestEnvGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl TestEnvGuard {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn parses_credentials_with_optional_totp() {
+        let yaml = br#"
+host.example:22:
+  username: alice
+  password: secret
+  totp_key: JBSWY3DPEHPK3PXP
+other.example:2222:
+  username: bob
+  password: password
+  totp_key: null
+"#;
+
+        let creds = parse_credentials(yaml).expect("valid credentials");
+        assert_eq!(creds["host.example:22"].username, "alice");
+        assert_eq!(
+            creds["host.example:22"].totp_key.as_deref(),
+            Some("JBSWY3DPEHPK3PXP")
+        );
+        assert_eq!(creds["other.example:2222"].totp_key, None);
+    }
+
+    #[test]
+    fn rejects_malformed_credentials() {
+        assert!(parse_credentials(b"host:22: [").is_err());
+    }
+
+    #[test]
+    fn rejects_credentials_missing_required_fields() {
+        let yaml = b"host.example:22:\n  username: alice\n";
+        assert!(parse_credentials(yaml).is_err());
+    }
+
+    #[test]
+    fn finds_both_sops_executable_names() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let unix_name = dir.path().join("sops");
+        std::fs::write(&unix_name, b"").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&unix_name, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(find_sops_binary_in([dir.path()]), Some(unix_name));
+
+        std::fs::remove_file(dir.path().join("sops")).unwrap();
+        let windows_name = dir.path().join("sops.exe");
+        std::fs::write(&windows_name, b"").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&windows_name, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(find_sops_binary_in([dir.path()]), Some(windows_name));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_non_executable_sops_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("sops"), b"").unwrap();
+        let executable = second.path().join("sops");
+        std::fs::write(&executable, b"").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            find_sops_binary_in([first.path(), second.path()]),
+            Some(executable)
+        );
+    }
+
+    #[test]
+    fn reports_missing_sops_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(find_sops_binary_in([dir.path()]), None);
+    }
+
+    #[test]
+    fn selects_identity_file_for_matching_ssh_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "Host jump.example\n  IdentityFile /keys/jump_ed25519\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            identity_file_from_config(&path, "jump.example").unwrap(),
+            Some(PathBuf::from("/keys/jump_ed25519"))
+        );
+    }
+
+    #[test]
+    fn applies_wildcard_ssh_host_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "Host *.example\n  IdentityFile /keys/default_ed25519\n",
+        )
+        .unwrap();
+        assert_eq!(
+            identity_file_from_config(&path, "jump.example").unwrap(),
+            Some(PathBuf::from("/keys/default_ed25519"))
+        );
+    }
+
+    #[test]
+    fn returns_none_when_ssh_host_has_no_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(&path, "Host jump.example\n  User alice\n").unwrap();
+        assert_eq!(
+            identity_file_from_config(&path, "jump.example").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn reports_missing_or_malformed_ssh_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert!(identity_file_from_config(&missing, "jump.example").is_err());
+
+        let malformed = dir.path().join("config");
+        std::fs::write(&malformed, "Host [\n  IdentityFile\n").unwrap();
+        assert!(identity_file_from_config(&malformed, "jump.example").is_err());
+    }
+
+    #[test]
+    fn parses_supported_host_port_forms() {
+        for (input, host, port) in [
+            ("example.com:22", "example.com", 22),
+            ("127.0.0.1:2222", "127.0.0.1", 2222),
+            ("[::1]:22", "::1", 22),
+        ] {
+            let parsed = HostPort::try_from(input).unwrap();
+            assert_eq!(parsed.host, host);
+            assert_eq!(parsed.port, port);
+        }
+    }
+
+    #[test]
+    fn formats_ipv6_with_required_brackets() {
+        let parsed = HostPort::try_from("[::1]:22").unwrap();
+        assert_eq!(parsed.to_string(), "[::1]:22");
+    }
+
+    #[test]
+    fn converts_ipv6_host_port_to_socket_address() {
+        let parsed = HostPort::try_from("[::1]:22").unwrap();
+        let socket: SocketAddr = parsed.into();
+        assert_eq!(socket, "[::1]:22".parse().unwrap());
+    }
+
+    #[test]
+    fn rejects_invalid_host_port_forms() {
+        for input in [
+            "example.com",
+            "example.com:not-a-port",
+            ":22",
+            "ssh://example.com:22",
+        ] {
+            assert!(HostPort::try_from(input).is_err(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn preserves_supported_authentication_order() {
+        let methods = OrderedAuthMethods::parse(
+            "keyboard-interactive,unknown,password,publickey,hostbased,gssapi-with-mic",
+        );
+        assert_eq!(
+            methods.methods,
+            vec![
+                AuthMethod::KeyboardInteractive,
+                AuthMethod::Password,
+                AuthMethod::PublicKey,
+                AuthMethod::HostBased,
+                AuthMethod::GssapiWithMic,
+            ]
+        );
+    }
+
+    #[test]
+    fn authentication_method_parsing_is_trimmed_and_case_insensitive() {
+        let methods = OrderedAuthMethods::parse(" PASSWORD , PublicKey ");
+        assert_eq!(
+            methods.methods,
+            vec![AuthMethod::Password, AuthMethod::PublicKey]
+        );
+    }
+
+    #[test]
+    fn classifies_keyboard_interactive_prompts() {
+        let mut handler = TotpPromptHandler {
+            creds: Creds {
+                username: "alice".into(),
+                password: "secret".into(),
+                totp_key: Some("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into()),
+            },
+        };
+        let prompts = [
+            Prompt {
+                text: "Username: ".into(),
+                echo: true,
+            },
+            Prompt {
+                text: "Password: ".into(),
+                echo: false,
+            },
+            Prompt {
+                text: "Token: ".into(),
+                echo: false,
+            },
+            Prompt {
+                text: "Unsupported: ".into(),
+                echo: false,
+            },
+        ];
+        let responses = handler.prompt("alice", "", &prompts);
+        assert_eq!(responses[0], "alice");
+        assert_eq!(responses[1], "secret");
+        assert_eq!(responses[2].len(), 6);
+        assert_eq!(responses[3], "");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn decrypts_and_parses_sops_credentials() {
+        const AGE_IDENTITY: &str =
+            "AGE-SECRET-KEY-1D8JAD8SXNFVQEFHAUNNAX4QCE3K5CUKMT7YYHNGTUSSP97YGWL4STV89UH";
+        const AGE_RECIPIENT: &str =
+            "age1uc8zlurjyjpenrslc2thyl28u7ylz6x8c2g9yphvjha6xm8ppf3slq0l25";
+
+        let dir = tempfile::tempdir().unwrap();
+        let encrypted_path = dir.path().join("secrets.yaml");
+        let key_path = dir.path().join("age_key.txt");
+        std::fs::write(&key_path, AGE_IDENTITY).unwrap();
+        std::fs::write(
+            dir.path().join(".sops.yaml"),
+            format!("creation_rules:\n  - path_regex: secrets\\.yaml$\n    age: {AGE_RECIPIENT}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            &encrypted_path,
+            "jump.example:22:\n  username: alice\n  password: secret\n  totp_key: null\n",
+        )
+        .unwrap();
+
+        let sops_binary = PathBuf::from(find_sops_binary().unwrap());
+        let encrypted = Command::new(&sops_binary)
+            .current_dir(dir.path())
+            .env("SOPS_AGE_KEY_FILE", &key_path)
+            .args(["encrypt", "--in-place"])
+            .arg(&encrypted_path)
+            .output()
+            .unwrap();
+        assert!(
+            encrypted.status.success(),
+            "sops encryption failed: {}",
+            String::from_utf8_lossy(&encrypted.stderr)
+        );
+
+        let _env = TestEnvGuard::set("SOPS_AGE_KEY_FILE", &key_path);
+        let creds = decrypt_credentials(&sops_binary, &encrypted_path).unwrap();
+        assert_eq!(creds["jump.example:22"].username, "alice");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reports_sops_decryption_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt_path = dir.path().join("corrupt.yaml");
+        std::fs::write(&corrupt_path, "not encrypted").unwrap();
+        let sops_binary = PathBuf::from(find_sops_binary().unwrap());
+
+        let error = decrypt_credentials(&sops_binary, &corrupt_path).unwrap_err();
+        assert!(error.contains("SOPS decryption failed"), "{error}");
+    }
+
+    #[test]
+    fn listener_bind_failure_releases_startup_waiter() {
+        let occupied = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap().to_string();
+        let pair = Arc::new((Mutex::new(true), Condvar::new()));
+        let (_cancel_tx, cancel_rx) = async_channel::unbounded();
+        let config = ServerConfig {
+            ex: Arc::new(Executor::new()),
+            addr: address,
+            jump_hosts: Vec::new(),
+            remote_addr: None,
+            cmd: None,
+            creds: YamlCreds::new(),
+        };
+
+        let result = futures::executor::block_on(run_server(config, cancel_rx, pair.clone()));
+
+        assert!(result.is_err());
+        assert!(!*pair.0.lock().unwrap(), "startup waiter was not released");
+    }
 
     #[test]
     fn permit_is_returned_when_connection_finishes() {
